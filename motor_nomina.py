@@ -191,16 +191,52 @@ def procesar(df, p_ini, p_fin):
     return resultados
 
 
-def calcular(emp, salario, tipo="empleado"):
+def calcular_novedad(salario, tipo, dias, pct_override=None):
+    """Calcula el valor de una novedad. Retorna (devengado, deduccion, descripcion)"""
+    TIPOS = {
+        'INC_EPS':  ('Incapacidad EPS',               True,  True,  66.66, False),
+        'INC_ARL':  ('Incapacidad ARL',                True,  False, 100.0, False),
+        'MAT_PAT':  ('Licencia maternidad/paternidad', True,  False, 100.0, False),
+        'LIC_REM':  ('Licencia remunerada',            True,  False, 100.0, False),
+        'LIC_NREM': ('Licencia no remunerada',         True,  False, 0.0,   True),
+        'VACAC':    ('Vacaciones',                     True,  False, 100.0, False),
+        'DIA_FAM':  ('Día de la familia',              True,  False, 100.0, False),
+        'COMPENS':  ('Día compensatorio',              True,  False, 0.0,   False),
+        'CALAM':    ('Calamidad doméstica',            True,  False, 100.0, False),
+        'SUSPEND':  ('Suspensión disciplinaria',       True,  False, 0.0,   True),
+        'AUS_INJ':  ('Ausencia injustificada',         True,  False, 0.0,   True),
+        'RENUNCIA': ('Liquidación por renuncia',       True,  False, 100.0, False),
+        'INGRESO':  ('Ingreso parcial período',        True,  False, 100.0, False),
+    }
+    cfg = TIPOS.get(tipo)
+    if not cfg:
+        return (0, 0, f'Novedad desconocida: {tipo}')
+    desc, afecta, req_pct, pct_def, es_ded = cfg
+    pct = pct_override if pct_override is not None else pct_def
+    valor_dia = salario / 30
+    if tipo == 'COMPENS':
+        return (0, 0, f'{desc} — {dias} día(s) — Justificado sin pago adicional')
+    elif tipo in ['RENUNCIA', 'INGRESO']:
+        # Solo es informativo — el cálculo proporcional ya está en los días trabajados
+        return (0, 0, f'{desc} — {dias} día(s) trabajado(s) en el período')
+    elif es_ded:
+        val = valor_dia * dias
+        return (0, val, f'{desc} — {dias} día(s) — Descuento: ${val:,.0f}')
+    else:
+        val = valor_dia * dias * (pct / 100)
+        return (val, 0, f'{desc} — {dias} día(s) al {pct:.2f}% — Pago: ${val:,.0f}')
+
+
+def calcular(emp, salario, tipo="empleado", novedades_emp=None):
     """
     tipo='empleado'  → contrato laboral, salario/220 = valor hora, deducciones salud/pension
     tipo='prestador' → salario = valor_hora fijo (ej $10,000/h), sin deducciones
+    novedades_emp    → lista de dicts [{'tipo':..., 'dias':..., 'pct':..., 'valor_override':...}]
     """
     QDIA = HORAS_QUINCENA / 24
     MAXE = MAX_EXTRAS_NOM / 24
 
     if tipo == "prestador":
-        # Para prestadores: salario ES el valor por hora directamente
         vh = salario
     else:
         vh = salario / HORAS_MES
@@ -209,12 +245,10 @@ def calcular(emp, salario, tipo="empleado"):
     noct = sum(d['noct'] for d in emp['dias'])
 
     if tipo == "prestador":
-        # Prestador: pago por horas trabajadas, sin comparar vs 88h
         ext  = 0.0
         deu  = 0.0
         en   = 0.0
         ee   = 0.0
-        # valor total = horas trabajadas × valor_hora
         val_total_prest = tot * 24 * vh
     else:
         ext  = max(0.0, tot - QDIA)
@@ -224,6 +258,28 @@ def calcular(emp, salario, tipo="empleado"):
         val_total_prest = 0.0
 
     dias_trab = sum(1 for d in emp['dias'] if d['trab'] > 0)
+
+    # ── Calcular novedades ─────────────────────────────────────────────────────
+    nov_devengado = 0.0
+    nov_deduccion = 0.0
+    nov_detalle   = []
+    if novedades_emp:
+        for nov in novedades_emp:
+            dev, ded, desc = calcular_novedad(
+                salario, nov.get('tipo',''), nov.get('dias', 1),
+                nov.get('pct')
+            )
+            if nov.get('valor_override') is not None:
+                if dev > 0: dev = float(nov['valor_override']); ded = 0
+                else:       ded = float(nov['valor_override']); dev = 0
+                desc = desc.split(' — Pago:')[0] + f" — Valor ajustado: ${nov['valor_override']:,.0f}"
+            nov_devengado += dev
+            nov_deduccion += ded
+            nov_detalle.append({
+                'tipo': nov.get('tipo',''), 'dias': nov.get('dias',1),
+                'pct': nov.get('pct'), 'devengado': dev,
+                'deduccion': ded, 'desc': desc
+            })
 
     return dict(salario=salario, vh=vh, tipo=tipo,
                 tot=tot, noct=noct, ext=ext, deu=deu,
@@ -235,7 +291,10 @@ def calcular(emp, salario, tipo="empleado"):
                 val_noct=noct*24*vh*FACTOR_NOCT,
                 val_deu=deu*24*vh,
                 val_total_prest=val_total_prest,
-                dias_trab=dias_trab)
+                dias_trab=dias_trab,
+                nov_devengado=nov_devengado,
+                nov_deduccion=nov_deduccion,
+                nov_detalle=nov_detalle)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
