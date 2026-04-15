@@ -264,6 +264,8 @@ if "⚙️" in modulo:
             "CALAM":    "Calamidad doméstica",
             "SUSPEND":  "Suspensión disciplinaria",
             "AUS_INJ":  "Ausencia injustificada",
+            "RENUNCIA": "Renuncia / Retiro (días trabajados)",
+            "INGRESO":  "Ingreso nuevo (días trabajados en período)",
         }
         TIPOS_LISTA = list(TIPOS_NOV.values())
         TIPOS_KEYS  = list(TIPOS_NOV.keys())
