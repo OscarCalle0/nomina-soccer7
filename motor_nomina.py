@@ -134,7 +134,72 @@ C = dict(
 #  PROCESAMIENTO MARCACIONES
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _descartar_duplicados(marcaciones, ventana_min=10):
+    """
+    Elimina marcaciones con diferencia < ventana_min minutos del mismo tipo.
+    Ordena cronológicamente y guarda solo la primera de cada ráfaga.
+    """
+    if not marcaciones:
+        return marcaciones
+    ordenadas = sorted(marcaciones, key=lambda m: m['fecha'])
+    resultado = [ordenadas[0]]
+    for m in ordenadas[1:]:
+        diff = (m['fecha'] - resultado[-1]['fecha']).total_seconds() / 60
+        if m['estado'] == resultado[-1]['estado'] and diff < ventana_min:
+            continue  # duplicado — descartar
+        resultado.append(m)
+    return resultado
+
+
+def _parear_turnos(marcaciones_dia):
+    """
+    Dada una lista de marcaciones de un día (ya sin duplicados, ordenadas),
+    intenta parear E→S. Si una entrada no tiene salida o viceversa,
+    la deja con par=None y marca la alerta.
+    Retorna lista de turnos: [{'entrada': dt|None, 'salida': dt|None, 'alerta': str}]
+    """
+    turnos = []
+    i = 0
+    mlist = sorted(marcaciones_dia, key=lambda m: m['fecha'])
+
+    while i < len(mlist):
+        m = mlist[i]
+        if m['estado'] == 'Entrada':
+            # Buscar la siguiente Salida
+            if i + 1 < len(mlist) and mlist[i+1]['estado'] == 'Salida':
+                turnos.append({'entrada': m['fecha'], 'salida': mlist[i+1]['fecha'], 'alerta': ''})
+                i += 2
+            else:
+                # Entrada sin salida
+                turnos.append({'entrada': m['fecha'], 'salida': None, 'alerta': 'sin_salida'})
+                i += 1
+        elif m['estado'] == 'Salida':
+            # Salida sin entrada previa
+            turnos.append({'entrada': None, 'salida': m['fecha'], 'alerta': 'sin_entrada'})
+            i += 1
+        else:
+            i += 1
+
+    return turnos
+
+
+def _calcular_turno(entrada, salida, hora_noct_ini=HORA_NOCT_INI):
+    """Calcula horas trabajadas y recargo nocturno de un turno."""
+    if not entrada or not salida or salida <= entrada:
+        return 0.0, 0.0
+    trab = (salida - entrada).total_seconds() / 86400
+    ns = entrada.replace(hour=hora_noct_ini, minute=0, second=0)
+    # Si la salida cruza medianoche el recargo se calcula correctamente igual
+    noct = max(0.0, (salida - max(entrada, ns)).total_seconds() / 86400) if salida > ns else 0.0
+    return trab, noct
+
+
 def procesar(df, p_ini, p_fin):
+    """
+    Procesa el DataFrame del reloj biométrico.
+    Soporta múltiples turnos por día, elimina duplicados < 10 min,
+    y calcula recargo nocturno por turno.
+    """
     by_emp = {}
     for _, row in df.iterrows():
         try: fecha = parse_date(str(row['Tiempo']))
@@ -142,48 +207,87 @@ def procesar(df, p_ini, p_fin):
         num = str(row.get('Número', row.get('Numero', ''))).strip()
         nom = str(row.get('Nombre', '')).strip()
         est = str(row.get('Estado', '')).strip()
+        # Ignorar marcaciones con nombre vacío
+        if not nom: continue
         k = f"{num}_{nom}"
         if k not in by_emp:
             by_emp[k] = {'id': num, 'nombre': nom, 'marcaciones': []}
-        by_emp[k]['marcaciones'].append({'fecha': fecha, 'estado': est})
+        by_emp[k]['marcaciones'].append({'fecha': fecha, 'estado': est, 'id_marca': len(by_emp[k]['marcaciones'])})
 
     resultados = []
     for k, emp in by_emp.items():
+        # Agrupar marcaciones por día
         dias_map = {}
         for m in emp['marcaciones']:
             dk = m['fecha'].strftime('%Y-%m-%d')
-            if dk not in dias_map: dias_map[dk] = {'E': [], 'S': []}
-            if m['estado'] == 'Entrada': dias_map[dk]['E'].append(m['fecha'])
-            else: dias_map[dk]['S'].append(m['fecha'])
+            if dk not in dias_map:
+                dias_map[dk] = []
+            dias_map[dk].append(m)
 
+        # Para cada día del período
         dias = []
         cur = p_ini
         while cur <= p_fin:
             dk = cur.strftime('%Y-%m-%d')
-            raw = dias_map.get(dk, {'E': [], 'S': []})
-            entrada = salida = None
-            ef = sf = 'ok'
+            raw_dia = dias_map.get(dk, [])
 
-            if raw['E']: entrada = sorted(raw['E'])[0]
-            else: ef = 'missing'
+            # Manejar salidas en madrugada del día siguiente
+            nk = (cur + timedelta(1)).strftime('%Y-%m-%d')
+            raw_siguiente = dias_map.get(nk, [])
+            madrugada = [m for m in raw_siguiente
+                         if m['estado'] == 'Salida' and m['fecha'].hour < HORA_MADRUGADA]
 
-            if raw['S']: salida = sorted(raw['S'])[-1]
+            todas_marcaciones = raw_dia + madrugada
+
+            if not todas_marcaciones:
+                dias.append({
+                    'fecha': cur, 'dk': dk,
+                    'turnos': [],        # lista de turnos del día
+                    'entrada': None,     # compatibilidad — primer turno
+                    'salida': None,
+                    'ef': 'ok', 'sf': 'ok',
+                    'trab': 0.0, 'noct': 0.0,
+                    'tiene': False,
+                    'marcaciones_raw': [],  # para el preinforme editable
+                })
             else:
-                nk = (cur + timedelta(1)).strftime('%Y-%m-%d')
-                early = [s for s in dias_map.get(nk, {'S': []})['S'] if s.hour < HORA_MADRUGADA]
-                if early: salida = sorted(early)[-1]
-                else: sf = 'missing'
+                # Descartar duplicados
+                sin_dup = _descartar_duplicados(todas_marcaciones, ventana_min=10)
+                # Parear turnos
+                turnos = _parear_turnos(sin_dup)
 
-            trab = noct = 0.0
-            if entrada and salida and salida > entrada:
-                trab = (salida - entrada).total_seconds() / 86400
-                ns = entrada.replace(hour=HORA_NOCT_INI, minute=0, second=0)
-                if salida > ns:
-                    noct = (salida - max(entrada, ns)).total_seconds() / 86400
+                # Calcular horas totales sumando todos los turnos
+                trab_total = 0.0
+                noct_total = 0.0
+                alertas    = []
+                for t in turnos:
+                    if t['alerta']:
+                        alertas.append(t['alerta'])
+                    else:
+                        tr, nr = _calcular_turno(t['entrada'], t['salida'])
+                        trab_total += tr
+                        noct_total += nr
 
-            tiene = bool(raw['E'] or raw['S'])
-            dias.append({'fecha': cur, 'dk': dk, 'entrada': entrada, 'salida': salida,
-                         'ef': ef, 'sf': sf, 'trab': trab, 'noct': noct, 'tiene': tiene})
+                # Primera entrada / última salida para compatibilidad con colilla
+                entradas = [t['entrada'] for t in turnos if t['entrada']]
+                salidas  = [t['salida']  for t in turnos if t['salida']]
+                primera_entrada = min(entradas) if entradas else None
+                ultima_salida   = max(salidas)  if salidas  else None
+
+                ef = 'missing' if 'sin_entrada' in alertas else 'ok'
+                sf = 'missing' if 'sin_salida'  in alertas else 'ok'
+
+                dias.append({
+                    'fecha': cur, 'dk': dk,
+                    'turnos': turnos,
+                    'entrada': primera_entrada,
+                    'salida':  ultima_salida,
+                    'ef': ef, 'sf': sf,
+                    'trab': trab_total,
+                    'noct': noct_total,
+                    'tiene': True,
+                    'marcaciones_raw': sin_dup,  # para edición en preinforme
+                })
             cur += timedelta(1)
 
         resultados.append({**emp, 'dias': dias})
