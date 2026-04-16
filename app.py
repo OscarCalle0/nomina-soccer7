@@ -153,133 +153,193 @@ if "⚙️" in modulo:
 
         p_ini_dt = st.session_state["p_ini_dt"]
         p_fin_dt = st.session_state["p_fin_dt"]
-        DIAS_SEM  = ["Lun","Mar","Mié","Jue","Vie","Sáb","Dom"]
+        DIAS_SEM = ["Lun","Mar","Mié","Jue","Vie","Sáb","Dom"]
 
-        # ── Métricas globales ──────────────────────────────────────────────
-        total_alertas = sum(
-            len([d for d in e["dias"] if d["tiene"] and (d["ef"]=="missing" or d["sf"]=="missing")])
-            for e in resultados_raw)
-        total_sin = sum(len([d for d in e["dias"] if not d["tiene"]]) for e in resultados_raw)
-        total_ok  = sum(len([d for d in e["dias"] if d["tiene"] and d["ef"]=="ok" and d["sf"]=="ok"]) for e in resultados_raw)
+        TIPOS_NOV_PREINFORME = {
+            "— Sin novedad —": None,
+            "Vacaciones":                    "VACAC",
+            "Incapacidad EPS":               "INC_EPS",
+            "Incapacidad ARL (100%)":        "INC_ARL",
+            "Licencia remunerada":           "LIC_REM",
+            "Licencia no remunerada":        "LIC_NREM",
+            "Día de la familia":             "DIA_FAM",
+            "Día compensatorio":             "COMPENS",
+            "Calamidad doméstica":           "CALAM",
+            "Ausencia injustificada":        "AUS_INJ",
+            "Suspensión disciplinaria":      "SUSPEND",
+            "Maternidad / Paternidad":       "MAT_PAT",
+            "Renuncia / Retiro":             "RENUNCIA",
+            "Ingreso nuevo en período":      "INGRESO",
+        }
+        TIPOS_NOV_LISTA = list(TIPOS_NOV_PREINFORME.keys())
+
+        # ── Métricas globales ─────────────────────────────────────────────
+        total_alertas = sum(len([d for d in e["dias"] if d["tiene"] and (d["ef"]=="missing" or d["sf"]=="missing")]) for e in resultados_raw)
+        total_sin     = sum(len([d for d in e["dias"] if not d["tiene"]]) for e in resultados_raw)
+        total_ok      = sum(len([d for d in e["dias"] if d["tiene"] and d["ef"]=="ok" and d["sf"]=="ok"]) for e in resultados_raw)
+        total_turnos  = sum(sum(len(d.get("turnos",[])) for d in e["dias"]) for e in resultados_raw)
 
         m1,m2,m3,m4 = st.columns(4)
         m1.metric("Colaboradoras", len(resultados_raw))
         m2.metric("Días completos ✅", total_ok)
-        m3.metric("Alertas ⚠️", total_alertas, delta="requieren revisión" if total_alertas else None, delta_color="inverse")
-        m4.metric("Sin registro ⚪", total_sin, delta="descanso o novedad" if total_sin else None, delta_color="off")
-
+        m3.metric("Alertas ⚠️", total_alertas,
+                  delta="revisar" if total_alertas else None, delta_color="inverse")
+        m4.metric("Turnos registrados", total_turnos)
         st.divider()
 
-        # ── Preinforme por colaboradora ────────────────────────────────────
+        # Inicializar estado de novedades del preinforme si no existe
+        if "novedades_preinforme" not in st.session_state:
+            st.session_state["novedades_preinforme"] = {}
+
+        # ── Panel por colaboradora ────────────────────────────────────────
         for emp_idx, emp in enumerate(resultados_raw):
             col_db     = get_colaborador_por_reloj(emp["nombre"], colaboradores_db)
-            dias_ok    = [d for d in emp["dias"] if d["tiene"] and d["ef"]=="ok" and d["sf"]=="ok"]
+            horas_tot  = sum(d["trab"]*24 for d in emp["dias"])
             dias_alert = [d for d in emp["dias"] if d["tiene"] and (d["ef"]=="missing" or d["sf"]=="missing")]
             dias_sin   = [d for d in emp["dias"] if not d["tiene"]]
-            horas_tot  = sum(d["trab"]*24 for d in emp["dias"] if d["trab"])
+            dias_ok_e  = [d for d in emp["dias"] if d["tiene"] and d["ef"]=="ok" and d["sf"]=="ok"]
+            n_turnos   = sum(len(d.get("turnos",[])) for d in emp["dias"])
 
             icono  = "⚠️" if dias_alert else "✅"
-            bd_txt = "✅ En BD" if col_db else "❌ No registrada en el sistema"
+            bd_txt = "" if col_db else " · ❌ No en BD"
             titulo = (f"{icono} **{emp['nombre']}** — "
-                      f"{horas_tot:.1f}h · {len(dias_ok)} OK · "
-                      f"{len(dias_alert)} alertas · {len(dias_sin)} sin registro · {bd_txt}")
+                      f"{horas_tot:.1f}h · {n_turnos} turno(s) · "
+                      f"{len(dias_alert)} alertas · {len(dias_sin)} sin registro{bd_txt}")
 
             with st.expander(titulo, expanded=bool(dias_alert)):
                 if not col_db:
-                    st.warning(f"⚠️ {emp['nombre']} no está en la base de datos. Agrégala en el módulo **Colaboradores** antes de continuar.")
+                    st.warning(f"⚠️ {emp['nombre']} no está en la base de datos. Agrégala en **Colaboradores**.")
 
-                # Tabla de días con semáforo
-                st.markdown("**Días del período:**")
-
-                # Cabecera
-                hc1,hc2,hc3,hc4,hc5,hc6,hc7 = st.columns([1.2,1.2,1.2,1.5,1.5,2,0.8])
-                hc1.caption("Fecha"); hc2.caption("Entrada reloj"); hc3.caption("Salida reloj")
-                hc4.caption("Nueva entrada"); hc5.caption("Nueva salida")
-                hc6.caption("Estado"); hc7.caption("Horas")
-
-                correcciones_emp = {}
+                emp_id = emp["id"]
 
                 for d in emp["dias"]:
                     dia_nom   = DIAS_SEM[d["fecha"].weekday()]
-                    fecha_str = f"{dia_nom} {d['fecha'].day:02d}/{d['fecha'].month:02d}"
+                    fecha_lbl = f"**{dia_nom} {d['fecha'].day:02d}/{d['fecha'].month:02d}**"
+                    dk        = d["dk"]
+                    nov_key   = f"{emp['nombre']}_{dk}"
 
-                    entrada_reloj = d["entrada"].strftime("%H:%M") if d["entrada"] else "—"
-                    salida_reloj  = d["salida"].strftime("%H:%M")  if d["salida"]  else "—"
-
+                    # Color de fondo según estado
                     if not d["tiene"]:
-                        estado_txt = "⚪ Sin registro"
-                        estado_color = "color:#888"
-                    elif d["ef"] == "missing":
-                        estado_txt = "🟠 Sin ENTRADA"
-                        estado_color = "color:#E59866"
-                    elif d["sf"] == "missing":
-                        estado_txt = "🟠 Sin SALIDA"
-                        estado_color = "color:#E59866"
+                        st.markdown(f"<div style='border-left:3px solid #ccc;padding:4px 8px;margin:2px 0;background:#fafafa;border-radius:4px'>{fecha_lbl} &nbsp; ⚪ Sin registro</div>", unsafe_allow_html=True)
+                    elif d["ef"]=="missing" or d["sf"]=="missing":
+                        st.markdown(f"<div style='border-left:3px solid #E59866;padding:4px 8px;margin:2px 0;background:#fff8f3;border-radius:4px'>{fecha_lbl} &nbsp; ⚠️ Alerta</div>", unsafe_allow_html=True)
                     else:
-                        estado_txt = "🟢 Completo"
-                        estado_color = "color:#1E8449"
+                        horas_dia = d['trab']*24
+                        recargo_dia = d['noct']*24
+                        n_t = len(d.get("turnos",[]))
+                        st.markdown(f"<div style='border-left:3px solid #1E8449;padding:4px 8px;margin:2px 0;background:#f6fff8;border-radius:4px'>{fecha_lbl} &nbsp; 🟢 {horas_dia:.1f}h · {n_t} turno(s) · Recargo noct: {recargo_dia:.1f}h</div>", unsafe_allow_html=True)
 
-                    horas_str = f"{d['trab']*24:.1f}h" if d["trab"] else "—"
+                    # ── Turnos del día ────────────────────────────────────
+                    turnos_dia = d.get("turnos", [])
+                    if turnos_dia:
+                        for t_idx, turno in enumerate(turnos_dia):
+                            tc1,tc2,tc3,tc4,tc5,tc6 = st.columns([1,1.2,1.2,1.2,1.2,0.6])
+                            tc1.caption(f"Turno {t_idx+1}")
+                            # Entrada
+                            e_val = turno["entrada"].strftime("%H:%M") if turno["entrada"] else ""
+                            e_color = "color:#E59866" if turno["alerta"]=="sin_entrada" else "color:#333"
+                            e_icon  = "❌" if turno["alerta"]=="sin_entrada" else ""
+                            tc2.markdown(f"<span style='font-family:monospace;font-size:13px;{e_color}'>E: {e_val or f'{e_icon} falta'}</span>", unsafe_allow_html=True)
+                            # Salida
+                            s_val = turno["salida"].strftime("%H:%M") if turno["salida"] else ""
+                            s_color = "color:#E59866" if turno["alerta"]=="sin_salida" else "color:#333"
+                            s_icon  = "❌" if turno["alerta"]=="sin_salida" else ""
+                            tc3.markdown(f"<span style='font-family:monospace;font-size:13px;{s_color}'>S: {s_val or f'{s_icon} falta'}</span>", unsafe_allow_html=True)
+                            # Corrección inline
+                            nueva_e = tc4.text_input("", placeholder="Nueva entrada HH:MM",
+                                                      key=f"te_{emp_idx}_{dk}_{t_idx}", label_visibility="collapsed")
+                            nueva_s = tc5.text_input("", placeholder="Nueva salida HH:MM",
+                                                      key=f"ts_{emp_idx}_{dk}_{t_idx}", label_visibility="collapsed")
+                            # Botón eliminar turno
+                            if tc6.button("🗑️", key=f"del_t_{emp_idx}_{dk}_{t_idx}", help="Eliminar este turno"):
+                                # Eliminar las marcaciones de este turno del df
+                                df_actual = st.session_state["df_reloj"]
+                                tiempos_a_borrar = set()
+                                if turno["entrada"]: tiempos_a_borrar.add(turno["entrada"].strftime("%d/%m/%Y %H:%M:%S"))
+                                if turno["salida"]:  tiempos_a_borrar.add(turno["salida"].strftime("%d/%m/%Y %H:%M:%S"))
+                                if tiempos_a_borrar:
+                                    mask = ~(
+                                        (df_actual["Nombre"] == emp["nombre"]) &
+                                        (df_actual["Tiempo"].astype(str).isin(tiempos_a_borrar))
+                                    )
+                                    df_filtrado = df_actual[mask].reset_index(drop=True)
+                                    nuevos_res = procesar(df_filtrado, p_ini_dt, p_fin_dt)
+                                    st.session_state["df_reloj"]       = df_filtrado
+                                    st.session_state["resultados_raw"]  = nuevos_res
+                                    st.success(f"✅ Turno eliminado")
+                                    st.rerun()
 
-                    row_key = f"pre_{emp_idx}_{d['dk']}"
-                    c1,c2,c3,c4,c5,c6,c7 = st.columns([1.2,1.2,1.2,1.5,1.5,2,0.8])
+                            # Guardar correcciones ingresadas (se aplican con botón global abajo)
+                            if nueva_e.strip() or nueva_s.strip():
+                                ckey = f"corr_{emp_idx}_{dk}_{t_idx}"
+                                if "correcciones_pendientes" not in st.session_state:
+                                    st.session_state["correcciones_pendientes"] = {}
+                                st.session_state["correcciones_pendientes"][ckey] = {
+                                    "nombre": emp["nombre"], "emp_id": emp_id,
+                                    "fecha_str": d["fecha"].strftime("%d/%m/%Y"),
+                                    "fecha_dt": d["fecha"],
+                                    "entrada": nueva_e.strip() or None,
+                                    "salida":  nueva_s.strip() or None,
+                                }
 
-                    with c1: st.markdown(f"<span style='font-size:13px'>{fecha_str}</span>", unsafe_allow_html=True)
-                    with c2: st.markdown(f"<span style='font-family:monospace;font-size:13px'>{entrada_reloj}</span>", unsafe_allow_html=True)
-                    with c3: st.markdown(f"<span style='font-family:monospace;font-size:13px'>{salida_reloj}</span>", unsafe_allow_html=True)
-                    with c4:
-                        nueva_entrada = st.text_input(
-                            "NE", value="", placeholder="HH:MM",
-                            key=f"ne_{emp_idx}_{d['dk']}",
-                            label_visibility="collapsed"
-                        )
-                    with c5:
-                        nueva_salida = st.text_input(
-                            "NS", value="", placeholder="HH:MM",
-                            key=f"ns_{emp_idx}_{d['dk']}",
-                            label_visibility="collapsed"
-                        )
-                    with c6:
-                        st.markdown(f"<span style='{estado_color};font-size:12px'>{estado_txt}</span>", unsafe_allow_html=True)
-                    with c7:
-                        st.markdown(f"<span style='font-size:12px;font-family:monospace'>{horas_str}</span>", unsafe_allow_html=True)
+                    # ── Agregar turno nuevo a este día ────────────────────
+                    with st.container():
+                        na1,na2,na3,na4 = st.columns([1,1.5,1.5,1.5])
+                        na1.caption("➕ Nuevo turno")
+                        add_e = na2.text_input("", placeholder="Entrada HH:MM",
+                                               key=f"add_e_{emp_idx}_{dk}", label_visibility="collapsed")
+                        add_s = na3.text_input("", placeholder="Salida HH:MM",
+                                               key=f"add_s_{emp_idx}_{dk}", label_visibility="collapsed")
+                        if add_e.strip() or add_s.strip():
+                            if "correcciones_pendientes" not in st.session_state:
+                                st.session_state["correcciones_pendientes"] = {}
+                            st.session_state["correcciones_pendientes"][f"add_{emp_idx}_{dk}"] = {
+                                "nombre": emp["nombre"], "emp_id": emp_id,
+                                "fecha_str": d["fecha"].strftime("%d/%m/%Y"),
+                                "fecha_dt": d["fecha"],
+                                "entrada": add_e.strip() or None,
+                                "salida":  add_s.strip() or None,
+                            }
 
-                    if nueva_entrada.strip() or nueva_salida.strip():
-                        correcciones_emp[d["dk"]] = {
-                            "nombre": emp["nombre"],
-                            "fecha": d["fecha"].strftime("%d/%m/%Y"),
-                            "entrada": nueva_entrada.strip() or None,
-                            "salida":  nueva_salida.strip()  or None,
-                        }
+                    # ── Novedad del día ───────────────────────────────────
+                    nov_actual = st.session_state["novedades_preinforme"].get(nov_key, "— Sin novedad —")
+                    nov_sel = st.selectbox(
+                        f"Novedad {d['fecha'].strftime('%d/%m')}",
+                        TIPOS_NOV_LISTA,
+                        index=TIPOS_NOV_LISTA.index(nov_actual) if nov_actual in TIPOS_NOV_LISTA else 0,
+                        key=f"nov_{emp_idx}_{dk}",
+                        label_visibility="collapsed"
+                    )
+                    if nov_sel != "— Sin novedad —":
+                        st.session_state["novedades_preinforme"][nov_key] = nov_sel
+                        st.caption(f"📌 {nov_sel} registrado para {d['fecha'].strftime('%d/%m')}")
+                    elif nov_key in st.session_state["novedades_preinforme"]:
+                        del st.session_state["novedades_preinforme"][nov_key]
 
-                # Botón aplicar correcciones de este empleado
-                if correcciones_emp:
-                    st.markdown("")
+                    st.markdown("---")
+
+                # ── Botón aplicar todas las correcciones de esta persona ──
+                correcciones = {k:v for k,v in st.session_state.get("correcciones_pendientes",{}).items()
+                                if v.get("nombre")==emp["nombre"]}
+                if correcciones:
+                    st.info(f"📝 {len(correcciones)} corrección(es) pendiente(s) para {emp['nombre'].split()[0]}")
                     if st.button(f"✅ Aplicar correcciones de {emp['nombre'].split()[0]}",
                                  key=f"apply_{emp_idx}", type="primary"):
                         df_actual = st.session_state["df_reloj"]
                         filas_nuevas = []
                         errores_c = []
-
-                        for dk, corr in correcciones_emp.items():
-                            emp_data = next((e for e in resultados_raw if e["nombre"] == corr["nombre"]), None)
-                            emp_id   = emp_data["id"] if emp_data else "0"
-                            try:
-                                fecha_dt = datetime.strptime(corr["fecha"], "%d/%m/%Y")
-                            except:
-                                errores_c.append(f"Fecha inválida: {corr['fecha']}"); continue
-
+                        for ckey, corr in correcciones.items():
+                            fecha_dt = corr["fecha_dt"]
                             if corr["entrada"]:
                                 try:
                                     hh,mm = map(int, corr["entrada"].split(":"))
                                     ts = fecha_dt.replace(hour=hh, minute=mm, second=0)
                                     filas_nuevas.append({
-                                        "Número": emp_id, "Nombre": corr["nombre"],
+                                        "Número": corr["emp_id"], "Nombre": corr["nombre"],
                                         "Tiempo": ts.strftime("%d/%m/%Y %H:%M:%S"),
                                         "Estado": "Entrada", "Dispositivos": "MANUAL", "Tipo de Registro": 0
                                     })
-                                except: errores_c.append(f"Hora entrada inválida: {corr['entrada']}")
-
+                                except: errores_c.append(f"Entrada inválida: {corr['entrada']}")
                             if corr["salida"]:
                                 try:
                                     hh,mm = map(int, corr["salida"].split(":"))
@@ -288,30 +348,56 @@ if "⚙️" in modulo:
                                     else:
                                         ts_s = fecha_dt.replace(hour=hh, minute=mm, second=0)
                                     filas_nuevas.append({
-                                        "Número": emp_id, "Nombre": corr["nombre"],
+                                        "Número": corr["emp_id"], "Nombre": corr["nombre"],
                                         "Tiempo": ts_s.strftime("%d/%m/%Y %H:%M:%S"),
                                         "Estado": "Salida", "Dispositivos": "MANUAL", "Tipo de Registro": 0
                                     })
-                                except: errores_c.append(f"Hora salida inválida: {corr['salida']}")
+                                except: errores_c.append(f"Salida inválida: {corr['salida']}")
 
                         if errores_c:
                             for e in errores_c: st.error(e)
-                        elif filas_nuevas:
-                            df_nuevo = pd.concat([df_actual, pd.DataFrame(filas_nuevas)], ignore_index=True)
+                        else:
+                            df_nuevo = pd.concat([df_actual, pd.DataFrame(filas_nuevas)], ignore_index=True) if filas_nuevas else df_actual
                             nuevos_res = procesar(df_nuevo, p_ini_dt, p_fin_dt)
-                            st.session_state["df_reloj"]      = df_nuevo
-                            st.session_state["resultados_raw"] = nuevos_res
-                            st.success(f"✅ {len(filas_nuevas)} marcación(es) aplicada(s) para {emp['nombre'].split()[0]}")
+                            st.session_state["df_reloj"]       = df_nuevo
+                            st.session_state["resultados_raw"]  = nuevos_res
+                            # Limpiar correcciones de esta persona
+                            for ckey in list(correcciones.keys()):
+                                del st.session_state["correcciones_pendientes"][ckey]
+                            st.success(f"✅ Correcciones aplicadas. El preinforme se actualizó.")
                             st.rerun()
 
-                # Resumen rápido al final del expander
-                st.divider()
-                rc1, rc2, rc3 = st.columns(3)
+                # Resumen del colaborador
+                rc1,rc2,rc3,rc4 = st.columns(4)
                 rc1.metric("Total horas", f"{horas_tot:.1f}h",
-                           delta=f"{horas_tot-88:.1f}h vs meta" if horas_tot else None,
-                           delta_color="normal")
-                rc2.metric("Días trabajados", len(dias_ok) + len(dias_alert))
-                rc3.metric("Días sin registro", len(dias_sin))
+                           delta=f"{horas_tot-88:+.1f}h vs 88h meta",
+                           delta_color="normal" if horas_tot >= 88 else "inverse")
+                rc2.metric("Turnos", n_turnos)
+                rc3.metric("Alertas", len(dias_alert))
+                rc4.metric("Sin registro", len(dias_sin))
+
+        # Consolidar novedades del preinforme al session_state de novedades
+        if st.session_state.get("novedades_preinforme"):
+            novedades_dict = st.session_state.get("novedades", {n["nombre"]: [] for n in resultados_raw})
+            # Limpiar novedades anteriores del preinforme y agregar las nuevas
+            for nov_key, tipo_desc in st.session_state["novedades_preinforme"].items():
+                nombre = "_".join(nov_key.split("_")[:-1])  # nombre sin la fecha
+                # Buscar nombre exacto
+                nombre_real = next((e["nombre"] for e in resultados_raw if nov_key.startswith(e["nombre"])), None)
+                if nombre_real and tipo_desc in TIPOS_NOV_PREINFORME:
+                    tipo_codigo = TIPOS_NOV_PREINFORME[tipo_desc]
+                    if tipo_codigo and nombre_real in novedades_dict:
+                        # Verificar que no esté duplicada
+                        ya_existe = any(n.get("tipo") == tipo_codigo for n in novedades_dict[nombre_real])
+                        if not ya_existe:
+                            novedades_dict[nombre_real].append({
+                                "tipo": tipo_codigo, "dias": 1,
+                                "pct": 66.66 if tipo_codigo == "INC_EPS" else 100.0 if tipo_codigo not in ["LIC_NREM","SUSPEND","AUS_INJ","COMPENS"] else 0.0,
+                                "valor_override": None
+                            })
+            st.session_state["novedades"] = novedades_dict
+
+
 
 
     with st.expander("✏️ Paso 3 — Marcaciones manuales (opcional)"):
