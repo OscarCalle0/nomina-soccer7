@@ -1,1101 +1,1236 @@
 """
-app.py — Sistema de Nómina GRANDA VARGAS SAS / Soccer 7
-App Streamlit completa con 4 módulos:
-  1. Procesar quincena
-  2. Colaboradores
-  3. Histórico
-  4. Nómina electrónica
+Sistema de Nómina Automatizada — GRANDA VARGAS SAS / Soccer 7
+Genera exactamente: REPORTE_HORARIOS_YYYYMMDD_YYYYMMDD.xlsx
+                    COLILLA_DE_PAGO_YYYYMMDD_YYYYMMDD.xlsx
+
+Uso:
+    python nomina_soccer7.py reporte_reloj.csv
+    python nomina_soccer7.py reporte_reloj.csv --inicio 2026-04-01 --fin 2026-04-15
+
+Fórmulas confirmadas contra archivos originales:
+    valor_hora       = salario / 220
+    hora_extra       = valor_hora × 1.25
+    recargo_nocturno = valor_hora × 0.35
+    quincena         = 88h = 3.6667 días (fracción)
+    max extras nóm.  = 8h
+    IBC cotización   = (salario/2) + auxilio_extras + recargo_noct
+    pension/salud    = IBC × 4% cada una
+    auxilio transp.  = 249,095 / 2 = 124,547.50 por quincena
 """
 
-import streamlit as st
 import pandas as pd
-import os, io, json, zipfile
-from datetime import datetime, date, timedelta
-from copy import deepcopy
+import openpyxl
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+from datetime import datetime, timedelta
+import argparse, calendar
 
-# ── Configuración de página ───────────────────────────────────────────────────
-st.set_page_config(
-    page_title="Nómina Soccer 7",
-    page_icon="⚽",
-    layout="wide",
-    initial_sidebar_state="expanded",
+# ═══════════════════════════════════════════════════════════════════════════════
+#  CONFIGURACIÓN — EDITAR AQUÍ
+# ═══════════════════════════════════════════════════════════════════════════════
+
+EMPRESA = {
+    "nombre": "GRANDA VARGAS SAS",
+    "nit":    "901436091-0",
+    "dir":    "CRA 51 45 -45",
+    "tel":    "8474747",
+}
+
+AUXILIO_TRANSPORTE_ANUAL = 249095   # 2026
+HORAS_MES       = 220               # divisor valor hora Colombia
+HORAS_QUINCENA  = 88
+MAX_EXTRAS_NOM  = 8                 # máx horas extras en nómina
+HORA_NOCT_INI   = 19                # desde 19:00 = recargo nocturno
+HORA_MADRUGADA  = 6                 # salidas antes de 6am = día anterior
+FACTOR_EXTRA    = 1.25
+FACTOR_NOCT     = 0.35
+PENSION_PCT     = 0.04
+SALUD_PCT       = 0.04
+SALARIO_MINIMO  = 1423500           # 2026
+
+# Datos de cada colaborador: (cedula, nombre_completo, cargo, banco, cuenta, eps, salario)
+COLABORADORES = {
+    # clave: (cedula, nombre_completo, cargo, banco, num_cuenta, eps, salario_mensual, tipo)
+    # tipo: "empleado" = contrato laboral (deducciones salud/pension)
+    #       "prestador" = prestador de servicio (sin deducciones, pago por hora)
+    "BERTHA RESTREPO":      ("43413529",   "BERTHA LIBIA RESTREPO LEDEZMA",      "JEFE DE COCINA",           "AHORROS DAVIVIENDA", "3974-0007-7277", "NUEVA EPS",   1806565, "empleado"),
+    "ERIKA  BERMUDEZ":      ("1047994257", "ERICA YORLADIS BERMUDEZ RAMIREZ",    "AUXILIAR DE COCINA",       "AHORROS DAVIVIENDA", "4884-4268-0267", "SAVIA SALUD", 1750905, "empleado"),
+    "ERIKA BERMUDEZ":       ("1047994257", "ERICA YORLADIS BERMUDEZ RAMIREZ",    "AUXILIAR DE COCINA",       "AHORROS DAVIVIENDA", "4884-4268-0267", "SAVIA SALUD", 1750905, "empleado"),
+    "DANIELA SANCHEZ":      ("1033340824", "DANIELA SANCHEZ TORRES",             "AUXILIAR DE COCINA",       "AHORROS DAVIVIENDA", "4884-3737-2466", "SAVIA SALUD", 1750905, "empleado"),
+    "CAROLINA ARANGO":      ("1033336422", "CAROLINA ARANGO GOMEZ",              "MESERA",                   "AHORROS DAVIVIENDA", "4884-4926-8538", "SAVIA SALUD", 1750905, "empleado"),
+    "KAROL QUINTERO":       ("1045018453", "KAROL DAYANA QUINTERO AGUDELO",      "MESERA",                   "AHORROS DAVIVIENDA", "3974-0008-5007", "SAVIA SALUD", 1750905, "empleado"),
+    "KATERINE SEPULVEDA":   ("1000211127", "KATERIN MARYORY SEPULVEDA CRUZ",     "MESERA",                   "AHORROS DAVIVIENDA", "4884-4926-8785", "SAVIA SALUD", 1750905, "empleado"),
+    "MARIA LIGELLA LOTERO": ("43844703",   "MARIA LIGELLA LOTERO",               "AUXILIAR ADMINISTRATIVA",  "AHORROS DAVIVIENDA", "4884-5662-0761", "SAVIA SALUD", 1750905, "empleado"),
+    "JULIANA GOMEZ":        ("",           "JULIANA GOMEZ",                      "MESERA",                   "AHORROS DAVIVIENDA", "",               "",            10000,    "prestador"),
+    # Valentina: empleada que no registra en el reloj (administrativa)
+    # Su pago se calcula manualmente y se agrega al resumen
+    "VALENTINA GRANDA":     ("1000397698", "VALENTINA GRANDA AGUDELO",           "AUXILIAR ADMINISTRATIVA",  "AHORROS DAVIVIENDA", "4884-5408-1842", "SAVIA SALUD", 1750905, "empleado"),
+}
+
+EXCEL_BASE = datetime(1899, 12, 30)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  HELPERS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def parse_date(s):
+    for fmt in ["%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M", "%m/%d/%Y %H:%M:%S"]:
+        try: return datetime.strptime(str(s).strip(), fmt)
+        except: pass
+    raise ValueError(f"Fecha no reconocida: {s}")
+
+def dt_frac(dt):
+    "datetime → fracción de día Excel (0.75 = 18:00)"
+    return (dt.hour * 3600 + dt.minute * 60 + dt.second) / 86400
+
+def frac_to_hm(f):
+    "0.75 → '18:00'"
+    h = int(f * 24); m = round((f * 24 - h) * 60)
+    return f"{h:02d}:{m:02d}"
+
+def date_serial(dt):
+    return (dt - EXCEL_BASE).days
+
+def thin(color="CCCCCC"):
+    s = Side(style="thin", color=color)
+    return Border(left=s, right=s, top=s, bottom=s)
+
+def medium_bottom(color="888888"):
+    b = Side(style="medium", color=color)
+    n = Side(style="none")
+    return Border(bottom=b, left=n, right=n, top=n)
+
+def fill(c): return PatternFill("solid", fgColor=c)
+def fnt(bold=False, color="000000", size=10, italic=False, name="Arial"):
+    return Font(name=name, bold=bold, color=color, size=size, italic=italic)
+def aln(h="left", v="center", wrap=False):
+    return Alignment(horizontal=h, vertical=v, wrap_text=wrap)
+
+def sc(ws, r, c, v, bold=False, bg=None, fc="000000", ha="left",
+       fmt=None, italic=False, b=True, size=10, wrap=False):
+    cell = ws.cell(row=r, column=c, value=v)
+    cell.font = fnt(bold=bold, color=fc, size=size, italic=italic)
+    cell.alignment = aln(h=ha, v="center", wrap=wrap)
+    if bg: cell.fill = fill(bg)
+    if b:  cell.border = thin()
+    if fmt: cell.number_format = fmt
+    return cell
+
+C = dict(
+    h1="1B3A5C", h2="2E6DA4", h_verde="1E8449", h_rojo="922B21",
+    alt="EEF4FB", verde_c="D5F5E3", rojo_c="FADBD8", naranja="E59866",
+    amarillo="FFF3CD", azul_c="D6EAF8", blanco="FFFFFF", gris="BDC3C7",
+    # colilla
+    col_h="1A237E",     # azul muy oscuro header empresa
+    col_sub="283593",
+    col_linea="3949AB",
+    col_dev="E8F5E9",   # devengado verde suave
+    col_ded="FFEBEE",   # deducciones rojo suave
+    col_total="E3F2FD", # totales azul suave
+    col_neto="1B3A5C",  # neto a pagar header
 )
 
-# ── Imports locales ───────────────────────────────────────────────────────────
-from datos import (
-    cargar_colaboradores, guardar_colaboradores, agregar_colaborador,
-    actualizar_colaborador, retirar_colaborador, get_colaborador_por_reloj,
-    cargar_historico, guardar_quincena_historico, historico_a_dataframe,
-    inicializar_datos, Colaborador, DATA_DIR
-)
-from colilla_pdf import generar_colilla_pdf, calcular_conceptos_colilla
-from nomina_electronica import generar_nomina_electronica_xlsx, preparar_datos_mes_desde_historico
-
-# Motor de nómina (del archivo existente)
-import sys
-sys.path.insert(0, os.path.dirname(__file__))
-from motor_nomina import (
-    procesar, calcular,
-    crear_reporte_horarios, crear_colilla_pago, crear_resumen_nomina,
-)
-
-# ── Inicializar datos ─────────────────────────────────────────────────────────
-inicializar_datos()
-
-# ── Estilos CSS ───────────────────────────────────────────────────────────────
-st.markdown("""
-<style>
-[data-testid="stSidebar"] { background: #1B3A5C; }
-[data-testid="stSidebar"] * { color: white !important; }
-[data-testid="stSidebar"] .stRadio label { color: #cce0f5 !important; font-size: 14px; }
-[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p { color: #93b4d4 !important; font-size: 12px; }
-.metric-card { background: #f8f9fa; border-radius: 8px; padding: 12px 16px; border: 1px solid #e0e0e0; }
-.badge-activo { background: #D5F5E3; color: #1E8449; padding: 2px 8px; border-radius: 12px; font-size: 12px; }
-.badge-inactivo { background: #FADBD8; color: #922B21; padding: 2px 8px; border-radius: 12px; font-size: 12px; }
-.badge-warn { background: #FFF3CD; color: #856404; padding: 2px 8px; border-radius: 12px; font-size: 12px; }
-h1 { color: #1B3A5C !important; }
-h2 { color: #1B3A5C !important; }
-h3 { color: #2E6DA4 !important; font-size: 15px !important; }
-</style>
-""", unsafe_allow_html=True)
-
-# ── Sidebar ───────────────────────────────────────────────────────────────────
-with st.sidebar:
-    logo_path = os.path.join(os.path.dirname(__file__), "logo.png")
-    if os.path.exists(logo_path):
-        st.image(logo_path, width=110)
-    st.markdown("## Sistema de Nómina")
-    st.markdown("GRANDA VARGAS SAS")
-    st.divider()
-
-    modulo = st.radio("Módulo", [
-        "⚙️  Procesar quincena",
-        "👥  Colaboradores",
-        "📋  Histórico",
-        "📊  Nómina electrónica",
-    ], label_visibility="collapsed")
-    st.divider()
-    st.markdown("Soccer 7 · v2.0")
-
 # ═══════════════════════════════════════════════════════════════════════════════
-# MÓDULO 1 — PROCESAR QUINCENA
+#  PROCESAMIENTO MARCACIONES
 # ═══════════════════════════════════════════════════════════════════════════════
-if "⚙️" in modulo:
-    st.title("⚙️ Procesar quincena")
-    colaboradores_db = cargar_colaboradores()
 
-    # ── PASO 1: Período ─────────────────────────────────────────────────────
-    with st.expander("📅 Paso 1 — Período de liquidación", expanded=True):
-        c1, c2, c3 = st.columns([1, 1, 2])
-        with c1:
-            fecha_ini = st.date_input("Desde", value=date.today().replace(day=1))
-        with c2:
-            fecha_fin = st.date_input("Hasta", value=date.today().replace(day=15))
-        with c3:
-            q_num = "primera" if fecha_ini.day == 1 else "segunda"
-            st.info(f"**{q_num.capitalize()} quincena** de {fecha_ini.strftime('%B %Y').capitalize()} · Meta: 88 horas")
-
-    # ── PASO 2: Archivo del reloj ─────────────────────────────────────────
-    with st.expander("📂 Paso 2 — Archivo del reloj biométrico", expanded=True):
-        archivo = st.file_uploader(
-            "Sube el reporte del Zkteco K50",
-            type=["xls", "xlsx", "csv", "txt"],
-            help="Acepta .xls, .xlsx y .csv exportados del reloj biométrico"
-        )
-
-        df_reloj = None
-        if archivo:
-            ext = archivo.name.lower().split(".")[-1]
-            try:
-                if ext == "xls":
-                    df_reloj = pd.read_excel(archivo, engine="xlrd")
-                elif ext in ["xlsx", "xlsm"]:
-                    df_reloj = pd.read_excel(archivo, engine="openpyxl")
-                else:
-                    for sep in [",", ";", "\t"]:
-                        try:
-                            archivo.seek(0)
-                            tmp = pd.read_csv(archivo, sep=sep, encoding="utf-8-sig")
-                            if len(tmp.columns) >= 4:
-                                df_reloj = tmp
-                                break
-                        except: pass
-
-                if df_reloj is not None:
-                    df_reloj.columns = [str(c).strip() for c in df_reloj.columns]
-                    if "Numero" in df_reloj.columns and "Número" not in df_reloj.columns:
-                        df_reloj.rename(columns={"Numero": "Número"}, inplace=True)
-
-                    p_ini_dt = datetime.combine(fecha_ini, datetime.min.time())
-                    p_fin_dt = datetime.combine(fecha_fin, datetime.max.time())
-                    resultados_raw = procesar(df_reloj, p_ini_dt, p_fin_dt)
-
-                    st.session_state["df_reloj"]       = df_reloj
-                    st.session_state["resultados_raw"]  = resultados_raw
-                    st.session_state["p_ini_dt"]        = p_ini_dt
-                    st.session_state["p_fin_dt"]        = p_fin_dt
-                    st.session_state["novedades"]       = {e["nombre"]: [] for e in resultados_raw}
-                    st.session_state["marcaciones_manuales"] = []
-
-                    st.success(f"✅ **{archivo.name}** · {len(df_reloj)} marcaciones · {len(resultados_raw)} colaboradoras")
-
-                else:
-                    st.error("No se pudo leer el archivo. Verifica el formato.")
-            except Exception as e:
-                st.error(f"Error leyendo el archivo: {e}")
-
-    # ── PRE-INFORME con edición directa ───────────────────────────────────
-    resultados_raw = st.session_state.get("resultados_raw", [])
-    if resultados_raw:
-        st.divider()
-        st.markdown("### 📋 Pre-informe — Revisión y corrección")
-        st.caption("Revisa cada colaboradora. Edita directamente las marcaciones incorrectas y aplica los cambios antes de calcular.")
-
-        p_ini_dt = st.session_state["p_ini_dt"]
-        p_fin_dt = st.session_state["p_fin_dt"]
-        DIAS_SEM = ["Lun","Mar","Mié","Jue","Vie","Sáb","Dom"]
-
-        TIPOS_NOV_PREINFORME = {
-            "— Sin novedad —": None,
-            "Vacaciones":                    "VACAC",
-            "Incapacidad EPS":               "INC_EPS",
-            "Incapacidad ARL (100%)":        "INC_ARL",
-            "Licencia remunerada":           "LIC_REM",
-            "Licencia no remunerada":        "LIC_NREM",
-            "Día de la familia":             "DIA_FAM",
-            "Día compensatorio":             "COMPENS",
-            "Calamidad doméstica":           "CALAM",
-            "Ausencia injustificada":        "AUS_INJ",
-            "Suspensión disciplinaria":      "SUSPEND",
-            "Maternidad / Paternidad":       "MAT_PAT",
-            "Renuncia / Retiro":             "RENUNCIA",
-            "Ingreso nuevo en período":      "INGRESO",
-        }
-        TIPOS_NOV_LISTA = list(TIPOS_NOV_PREINFORME.keys())
-
-        # ── Métricas globales ─────────────────────────────────────────────
-        total_alertas = sum(len([d for d in e["dias"] if d["tiene"] and (d["ef"]=="missing" or d["sf"]=="missing")]) for e in resultados_raw)
-        total_sin     = sum(len([d for d in e["dias"] if not d["tiene"]]) for e in resultados_raw)
-        total_ok      = sum(len([d for d in e["dias"] if d["tiene"] and d["ef"]=="ok" and d["sf"]=="ok"]) for e in resultados_raw)
-        total_turnos  = sum(sum(len(d.get("turnos",[])) for d in e["dias"]) for e in resultados_raw)
-
-        m1,m2,m3,m4 = st.columns(4)
-        m1.metric("Colaboradoras", len(resultados_raw))
-        m2.metric("Días completos ✅", total_ok)
-        m3.metric("Alertas ⚠️", total_alertas,
-                  delta="revisar" if total_alertas else None, delta_color="inverse")
-        m4.metric("Turnos registrados", total_turnos)
-        st.divider()
-
-        # Inicializar estado de novedades del preinforme si no existe
-        if "novedades_preinforme" not in st.session_state:
-            st.session_state["novedades_preinforme"] = {}
-
-        # ── Panel por colaboradora ────────────────────────────────────────
-        for emp_idx, emp in enumerate(resultados_raw):
-            col_db     = get_colaborador_por_reloj(emp["nombre"], colaboradores_db)
-            horas_tot  = sum(d["trab"]*24 for d in emp["dias"])
-            dias_alert = [d for d in emp["dias"] if d["tiene"] and (d["ef"]=="missing" or d["sf"]=="missing")]
-            dias_sin   = [d for d in emp["dias"] if not d["tiene"]]
-            dias_ok_e  = [d for d in emp["dias"] if d["tiene"] and d["ef"]=="ok" and d["sf"]=="ok"]
-            n_turnos   = sum(len(d.get("turnos",[])) for d in emp["dias"])
-
-            icono  = "⚠️" if dias_alert else "✅"
-            bd_txt = "" if col_db else " · ❌ No en BD"
-            titulo = (f"{icono} **{emp['nombre']}** — "
-                      f"{horas_tot:.1f}h · {n_turnos} turno(s) · "
-                      f"{len(dias_alert)} alertas · {len(dias_sin)} sin registro{bd_txt}")
-
-            with st.expander(titulo, expanded=bool(dias_alert)):
-                if not col_db:
-                    st.warning(f"⚠️ {emp['nombre']} no está en la base de datos. Agrégala en **Colaboradores**.")
-
-                emp_id = emp["id"]
-
-                for d in emp["dias"]:
-                    dia_nom   = DIAS_SEM[d["fecha"].weekday()]
-                    fecha_lbl = f"**{dia_nom} {d['fecha'].day:02d}/{d['fecha'].month:02d}**"
-                    dk        = d["dk"]
-                    nov_key   = f"{emp['nombre']}_{dk}"
-
-                    # Color de fondo según estado
-                    if not d["tiene"]:
-                        st.markdown(f"<div style='border-left:3px solid #ccc;padding:4px 8px;margin:2px 0;background:#fafafa;border-radius:4px'>{fecha_lbl} &nbsp; ⚪ Sin registro</div>", unsafe_allow_html=True)
-                    elif d["ef"]=="missing" or d["sf"]=="missing":
-                        st.markdown(f"<div style='border-left:3px solid #E59866;padding:4px 8px;margin:2px 0;background:#fff8f3;border-radius:4px'>{fecha_lbl} &nbsp; ⚠️ Alerta</div>", unsafe_allow_html=True)
-                    else:
-                        horas_dia = d['trab']*24
-                        recargo_dia = d['noct']*24
-                        n_t = len(d.get("turnos",[]))
-                        st.markdown(f"<div style='border-left:3px solid #1E8449;padding:4px 8px;margin:2px 0;background:#f6fff8;border-radius:4px'>{fecha_lbl} &nbsp; 🟢 {horas_dia:.1f}h · {n_t} turno(s) · Recargo noct: {recargo_dia:.1f}h</div>", unsafe_allow_html=True)
-
-                    # ── Turnos del día ────────────────────────────────────
-                    turnos_dia = d.get("turnos", [])
-                    if turnos_dia:
-                        for t_idx, turno in enumerate(turnos_dia):
-                            tc1,tc2,tc3,tc4,tc5,tc6 = st.columns([1,1.2,1.2,1.2,1.2,0.6])
-                            tc1.caption(f"Turno {t_idx+1}")
-                            # Entrada
-                            e_val = turno["entrada"].strftime("%H:%M") if turno["entrada"] else ""
-                            e_color = "color:#E59866" if turno["alerta"]=="sin_entrada" else "color:#333"
-                            e_icon  = "❌" if turno["alerta"]=="sin_entrada" else ""
-                            tc2.markdown(f"<span style='font-family:monospace;font-size:13px;{e_color}'>E: {e_val or f'{e_icon} falta'}</span>", unsafe_allow_html=True)
-                            # Salida
-                            s_val = turno["salida"].strftime("%H:%M") if turno["salida"] else ""
-                            s_color = "color:#E59866" if turno["alerta"]=="sin_salida" else "color:#333"
-                            s_icon  = "❌" if turno["alerta"]=="sin_salida" else ""
-                            tc3.markdown(f"<span style='font-family:monospace;font-size:13px;{s_color}'>S: {s_val or f'{s_icon} falta'}</span>", unsafe_allow_html=True)
-                            # Corrección inline
-                            nueva_e = tc4.text_input("", placeholder="Nueva entrada HH:MM",
-                                                      key=f"te_{emp_idx}_{dk}_{t_idx}", label_visibility="collapsed")
-                            nueva_s = tc5.text_input("", placeholder="Nueva salida HH:MM",
-                                                      key=f"ts_{emp_idx}_{dk}_{t_idx}", label_visibility="collapsed")
-                            # Botón eliminar turno
-                            if tc6.button("🗑️", key=f"del_t_{emp_idx}_{dk}_{t_idx}", help="Eliminar este turno"):
-                                # Eliminar las marcaciones de este turno del df
-                                df_actual = st.session_state["df_reloj"]
-                                tiempos_a_borrar = set()
-                                if turno["entrada"]: tiempos_a_borrar.add(turno["entrada"].strftime("%d/%m/%Y %H:%M:%S"))
-                                if turno["salida"]:  tiempos_a_borrar.add(turno["salida"].strftime("%d/%m/%Y %H:%M:%S"))
-                                if tiempos_a_borrar:
-                                    mask = ~(
-                                        (df_actual["Nombre"] == emp["nombre"]) &
-                                        (df_actual["Tiempo"].astype(str).isin(tiempos_a_borrar))
-                                    )
-                                    df_filtrado = df_actual[mask].reset_index(drop=True)
-                                    nuevos_res = procesar(df_filtrado, p_ini_dt, p_fin_dt)
-                                    st.session_state["df_reloj"]       = df_filtrado
-                                    st.session_state["resultados_raw"]  = nuevos_res
-                                    st.success(f"✅ Turno eliminado")
-                                    st.rerun()
-
-                            # Guardar correcciones ingresadas (se aplican con botón global abajo)
-                            if nueva_e.strip() or nueva_s.strip():
-                                ckey = f"corr_{emp_idx}_{dk}_{t_idx}"
-                                if "correcciones_pendientes" not in st.session_state:
-                                    st.session_state["correcciones_pendientes"] = {}
-                                st.session_state["correcciones_pendientes"][ckey] = {
-                                    "nombre": emp["nombre"], "emp_id": emp_id,
-                                    "fecha_str": d["fecha"].strftime("%d/%m/%Y"),
-                                    "fecha_dt": d["fecha"],
-                                    "entrada": nueva_e.strip() or None,
-                                    "salida":  nueva_s.strip() or None,
-                                }
-
-                    # ── Agregar turno nuevo a este día ────────────────────
-                    with st.container():
-                        na1,na2,na3,na4 = st.columns([1,1.5,1.5,1.5])
-                        na1.caption("➕ Nuevo turno")
-                        add_e = na2.text_input("", placeholder="Entrada HH:MM",
-                                               key=f"add_e_{emp_idx}_{dk}", label_visibility="collapsed")
-                        add_s = na3.text_input("", placeholder="Salida HH:MM",
-                                               key=f"add_s_{emp_idx}_{dk}", label_visibility="collapsed")
-                        if add_e.strip() or add_s.strip():
-                            if "correcciones_pendientes" not in st.session_state:
-                                st.session_state["correcciones_pendientes"] = {}
-                            st.session_state["correcciones_pendientes"][f"add_{emp_idx}_{dk}"] = {
-                                "nombre": emp["nombre"], "emp_id": emp_id,
-                                "fecha_str": d["fecha"].strftime("%d/%m/%Y"),
-                                "fecha_dt": d["fecha"],
-                                "entrada": add_e.strip() or None,
-                                "salida":  add_s.strip() or None,
-                            }
-
-                    # ── Novedad del día ───────────────────────────────────
-                    nov_actual = st.session_state["novedades_preinforme"].get(nov_key, "— Sin novedad —")
-                    nov_sel = st.selectbox(
-                        f"Novedad {d['fecha'].strftime('%d/%m')}",
-                        TIPOS_NOV_LISTA,
-                        index=TIPOS_NOV_LISTA.index(nov_actual) if nov_actual in TIPOS_NOV_LISTA else 0,
-                        key=f"nov_{emp_idx}_{dk}",
-                        label_visibility="collapsed"
-                    )
-                    if nov_sel != "— Sin novedad —":
-                        st.session_state["novedades_preinforme"][nov_key] = nov_sel
-                        st.caption(f"📌 {nov_sel} registrado para {d['fecha'].strftime('%d/%m')}")
-                    elif nov_key in st.session_state["novedades_preinforme"]:
-                        del st.session_state["novedades_preinforme"][nov_key]
-
-                    st.markdown("---")
-
-                # ── Botón aplicar todas las correcciones de esta persona ──
-                correcciones = {k:v for k,v in st.session_state.get("correcciones_pendientes",{}).items()
-                                if v.get("nombre")==emp["nombre"]}
-                if correcciones:
-                    st.info(f"📝 {len(correcciones)} corrección(es) pendiente(s) para {emp['nombre'].split()[0]}")
-                    if st.button(f"✅ Aplicar correcciones de {emp['nombre'].split()[0]}",
-                                 key=f"apply_{emp_idx}", type="primary"):
-                        df_actual = st.session_state["df_reloj"]
-                        filas_nuevas = []
-                        errores_c = []
-                        for ckey, corr in correcciones.items():
-                            fecha_dt = corr["fecha_dt"]
-                            if corr["entrada"]:
-                                try:
-                                    hh,mm = map(int, corr["entrada"].split(":"))
-                                    ts = fecha_dt.replace(hour=hh, minute=mm, second=0)
-                                    filas_nuevas.append({
-                                        "Número": corr["emp_id"], "Nombre": corr["nombre"],
-                                        "Tiempo": ts.strftime("%d/%m/%Y %H:%M:%S"),
-                                        "Estado": "Entrada", "Dispositivos": "MANUAL", "Tipo de Registro": 0
-                                    })
-                                except: errores_c.append(f"Entrada inválida: {corr['entrada']}")
-                            if corr["salida"]:
-                                try:
-                                    hh,mm = map(int, corr["salida"].split(":"))
-                                    if hh < 6 and corr["entrada"] and int(corr["entrada"].split(":")[0]) >= 12:
-                                        ts_s = (fecha_dt + timedelta(days=1)).replace(hour=hh, minute=mm, second=0)
-                                    else:
-                                        ts_s = fecha_dt.replace(hour=hh, minute=mm, second=0)
-                                    filas_nuevas.append({
-                                        "Número": corr["emp_id"], "Nombre": corr["nombre"],
-                                        "Tiempo": ts_s.strftime("%d/%m/%Y %H:%M:%S"),
-                                        "Estado": "Salida", "Dispositivos": "MANUAL", "Tipo de Registro": 0
-                                    })
-                                except: errores_c.append(f"Salida inválida: {corr['salida']}")
-
-                        if errores_c:
-                            for e in errores_c: st.error(e)
-                        else:
-                            df_nuevo = pd.concat([df_actual, pd.DataFrame(filas_nuevas)], ignore_index=True) if filas_nuevas else df_actual
-                            nuevos_res = procesar(df_nuevo, p_ini_dt, p_fin_dt)
-                            st.session_state["df_reloj"]       = df_nuevo
-                            st.session_state["resultados_raw"]  = nuevos_res
-                            # Limpiar correcciones de esta persona
-                            for ckey in list(correcciones.keys()):
-                                del st.session_state["correcciones_pendientes"][ckey]
-                            st.success(f"✅ Correcciones aplicadas. El preinforme se actualizó.")
-                            st.rerun()
-
-                # Resumen del colaborador
-                rc1,rc2,rc3,rc4 = st.columns(4)
-                rc1.metric("Total horas", f"{horas_tot:.1f}h",
-                           delta=f"{horas_tot-88:+.1f}h vs 88h meta",
-                           delta_color="normal" if horas_tot >= 88 else "inverse")
-                rc2.metric("Turnos", n_turnos)
-                rc3.metric("Alertas", len(dias_alert))
-                rc4.metric("Sin registro", len(dias_sin))
-
-        # Consolidar novedades del preinforme al session_state de novedades
-        if st.session_state.get("novedades_preinforme"):
-            novedades_dict = st.session_state.get("novedades", {n["nombre"]: [] for n in resultados_raw})
-            # Limpiar novedades anteriores del preinforme y agregar las nuevas
-            for nov_key, tipo_desc in st.session_state["novedades_preinforme"].items():
-                nombre = "_".join(nov_key.split("_")[:-1])  # nombre sin la fecha
-                # Buscar nombre exacto
-                nombre_real = next((e["nombre"] for e in resultados_raw if nov_key.startswith(e["nombre"])), None)
-                if nombre_real and tipo_desc in TIPOS_NOV_PREINFORME:
-                    tipo_codigo = TIPOS_NOV_PREINFORME[tipo_desc]
-                    if tipo_codigo and nombre_real in novedades_dict:
-                        # Verificar que no esté duplicada
-                        ya_existe = any(n.get("tipo") == tipo_codigo for n in novedades_dict[nombre_real])
-                        if not ya_existe:
-                            novedades_dict[nombre_real].append({
-                                "tipo": tipo_codigo, "dias": 1,
-                                "pct": 66.66 if tipo_codigo == "INC_EPS" else 100.0 if tipo_codigo not in ["LIC_NREM","SUSPEND","AUS_INJ","COMPENS"] else 0.0,
-                                "valor_override": None
-                            })
-            st.session_state["novedades"] = novedades_dict
-
-
-
-
-    with st.expander("✏️ Paso 3 — Marcaciones manuales (opcional)"):
-        st.caption("Agrega días que el reloj no registró. Deja vacío si no aplica.")
-
-        nombres_reloj = [e["nombre"] for e in st.session_state.get("resultados_raw", [])]
-        if not nombres_reloj:
-            st.info("Primero carga el archivo del reloj en el Paso 2.")
-        else:
-            if "marcaciones_form" not in st.session_state:
-                st.session_state["marcaciones_form"] = [
-                    {"nombre": "", "fecha": fecha_ini, "entrada": "08:00", "salida": "22:00"}
-                ]
-
-            mf = st.session_state["marcaciones_form"]
-
-            for i, row in enumerate(mf):
-                c1, c2, c3, c4, c5 = st.columns([2.5, 1.8, 1.2, 1.2, 0.4])
-                with c1:
-                    mf[i]["nombre"] = st.selectbox(
-                        "Colaboradora", ["— Seleccionar —"] + nombres_reloj,
-                        key=f"mn_{i}", index=nombres_reloj.index(row["nombre"])+1 if row["nombre"] in nombres_reloj else 0,
-                        label_visibility="collapsed"
-                    )
-                with c2:
-                    mf[i]["fecha"] = st.date_input("Fecha", value=row["fecha"],
-                                                    min_value=fecha_ini, max_value=fecha_fin,
-                                                    key=f"mf_{i}", label_visibility="collapsed")
-                with c3:
-                    mf[i]["entrada"] = st.text_input("Entrada", value=row["entrada"],
-                                                      key=f"me_{i}", placeholder="HH:MM",
-                                                      label_visibility="collapsed")
-                with c4:
-                    mf[i]["salida"] = st.text_input("Salida", value=row["salida"],
-                                                     key=f"ms_{i}", placeholder="HH:MM",
-                                                     label_visibility="collapsed")
-                with c5:
-                    if st.button("✕", key=f"mdel_{i}", help="Eliminar"):
-                        mf.pop(i)
-                        st.rerun()
-
-            if st.button("➕ Agregar día manual"):
-                mf.append({"nombre": "", "fecha": fecha_fin, "entrada": "08:00", "salida": "22:00"})
-                st.rerun()
-
-            if st.button("✅ Aplicar marcaciones manuales", type="primary"):
-                df_actual = st.session_state.get("df_reloj")
-                if df_actual is not None:
-                    filas_nuevas = []
-                    errores = []
-                    resultados_raw = st.session_state.get("resultados_raw", [])
-
-                    for row in mf:
-                        if not row["nombre"] or row["nombre"] == "— Seleccionar —":
-                            continue
-                        emp_data = next((e for e in resultados_raw if e["nombre"] == row["nombre"]), None)
-                        emp_id = emp_data["id"] if emp_data else "0"
-                        fecha_dt = datetime.combine(row["fecha"], datetime.min.time())
-
-                        try:
-                            if row["entrada"]:
-                                hh, mm = map(int, row["entrada"].split(":"))
-                                ts = fecha_dt.replace(hour=hh, minute=mm, second=0)
-                                filas_nuevas.append({"Número": emp_id, "Nombre": row["nombre"],
-                                    "Tiempo": ts.strftime("%d/%m/%Y %H:%M:%S"),
-                                    "Estado": "Entrada", "Dispositivos": "MANUAL", "Tipo de Registro": 0})
-                        except: errores.append(f"Entrada inválida para {row['nombre']}")
-
-                        try:
-                            if row["salida"]:
-                                hh, mm = map(int, row["salida"].split(":"))
-                                if hh < 6 and row["entrada"] and int(row["entrada"].split(":")[0]) >= 12:
-                                    ts_s = (fecha_dt + timedelta(days=1)).replace(hour=hh, minute=mm, second=0)
-                                else:
-                                    ts_s = fecha_dt.replace(hour=hh, minute=mm, second=0)
-                                filas_nuevas.append({"Número": emp_id, "Nombre": row["nombre"],
-                                    "Tiempo": ts_s.strftime("%d/%m/%Y %H:%M:%S"),
-                                    "Estado": "Salida", "Dispositivos": "MANUAL", "Tipo de Registro": 0})
-                        except: errores.append(f"Salida inválida para {row['nombre']}")
-
-                    if errores:
-                        for e in errores: st.error(e)
-                    elif filas_nuevas:
-                        df_combinado = pd.concat([df_actual, pd.DataFrame(filas_nuevas)], ignore_index=True)
-                        p_ini_dt = st.session_state["p_ini_dt"]
-                        p_fin_dt = st.session_state["p_fin_dt"]
-                        nuevos_res = procesar(df_combinado, p_ini_dt, p_fin_dt)
-                        st.session_state["df_reloj"] = df_combinado
-                        st.session_state["resultados_raw"] = nuevos_res
-                        st.success(f"✅ {len(filas_nuevas)} marcación(es) aplicada(s)")
-                        st.rerun()
-
-    # ── PASO 4: Novedades ─────────────────────────────────────────────────
-    with st.expander("📋 Paso 4 — Novedades (incapacidades, vacaciones, etc.)"):
-        st.caption("Registra novedades del período. Deja vacío si no hay.")
-
-        TIPOS_NOV = {
-            "INC_EPS":  "Incapacidad EPS",
-            "INC_ARL":  "Incapacidad ARL (100%)",
-            "MAT_PAT":  "Licencia maternidad/paternidad",
-            "LIC_REM":  "Licencia remunerada",
-            "LIC_NREM": "Licencia no remunerada",
-            "VACAC":    "Vacaciones",
-            "DIA_FAM":  "Día de la familia",
-            "COMPENS":  "Día compensatorio",
-            "CALAM":    "Calamidad doméstica",
-            "SUSPEND":  "Suspensión disciplinaria",
-            "AUS_INJ":  "Ausencia injustificada",
-            "RENUNCIA": "Renuncia / Retiro (días trabajados)",
-            "INGRESO":  "Ingreso nuevo (días trabajados en período)",
-        }
-        TIPOS_LISTA = list(TIPOS_NOV.values())
-        TIPOS_KEYS  = list(TIPOS_NOV.keys())
-
-        nombres_reloj = [e["nombre"] for e in st.session_state.get("resultados_raw", [])]
-        if not nombres_reloj:
-            st.info("Primero carga el archivo del reloj.")
-        else:
-            if "novedades_form" not in st.session_state:
-                st.session_state["novedades_form"] = []
-
-            nf = st.session_state["novedades_form"]
-
-            if nf:
-                c1h, c2h, c3h, c4h, c5h, _ = st.columns([2.5, 2.5, 0.8, 0.8, 1.5, 0.4])
-                for col, txt in zip([c1h,c2h,c3h,c4h,c5h],
-                                    ["Colaboradora","Tipo de novedad","Días","% Pago","Valor override"]):
-                    col.caption(txt)
-
-            for i, row in enumerate(nf):
-                c1, c2, c3, c4, c5, c6 = st.columns([2.5, 2.5, 0.8, 0.8, 1.5, 0.4])
-                with c1:
-                    idx_n = nombres_reloj.index(row["nombre"]) if row["nombre"] in nombres_reloj else 0
-                    nf[i]["nombre"] = st.selectbox("N", nombres_reloj, index=idx_n,
-                                                    key=f"nn_{i}", label_visibility="collapsed")
-                with c2:
-                    idx_t = TIPOS_LISTA.index(row["tipo_desc"]) if row["tipo_desc"] in TIPOS_LISTA else 0
-                    nf[i]["tipo_desc"] = st.selectbox("T", TIPOS_LISTA, index=idx_t,
-                                                       key=f"nt_{i}", label_visibility="collapsed")
-                    nf[i]["tipo"] = TIPOS_KEYS[TIPOS_LISTA.index(nf[i]["tipo_desc"])]
-                with c3:
-                    nf[i]["dias"] = st.number_input("D", min_value=0.5, max_value=30.0,
-                                                     value=float(row.get("dias", 1)), step=0.5,
-                                                     key=f"nd_{i}", label_visibility="collapsed")
-                with c4:
-                    pct_def = 100.0
-                    if nf[i]["tipo"] in ["INC_EPS"]: pct_def = 66.66
-                    if nf[i]["tipo"] in ["LIC_NREM","SUSPEND","AUS_INJ","COMPENS"]: pct_def = 0.0
-                    nf[i]["pct"] = st.number_input("P", min_value=0.0, max_value=100.0,
-                                                    value=float(row.get("pct", pct_def)), step=0.01,
-                                                    key=f"np_{i}", label_visibility="collapsed")
-                with c5:
-                    vo = row.get("valor_override", None)
-                    vo_str = str(int(vo)) if vo else ""
-                    vo_input = st.text_input("V", value=vo_str, key=f"nv_{i}",
-                                             placeholder="Opcional", label_visibility="collapsed")
-                    nf[i]["valor_override"] = float(vo_input) if vo_input.strip() else None
-                with c6:
-                    if st.button("✕", key=f"ndel_{i}"):
-                        nf.pop(i)
-                        st.rerun()
-
-            if st.button("➕ Agregar novedad"):
-                nf.append({"nombre": nombres_reloj[0] if nombres_reloj else "",
-                            "tipo": "VACAC", "tipo_desc": "Vacaciones",
-                            "dias": 1.0, "pct": 100.0, "valor_override": None})
-                st.rerun()
-
-            # Guardar novedades en session_state
-            novedades_dict = {n: [] for n in nombres_reloj}
-            for row in nf:
-                if row["nombre"] in novedades_dict:
-                    novedades_dict[row["nombre"]].append({
-                        "tipo": row["tipo"], "dias": row["dias"],
-                        "pct": row["pct"], "valor_override": row["valor_override"]
-                    })
-            st.session_state["novedades"] = novedades_dict
-
-    # ── PASO 5: Calcular y descargar ──────────────────────────────────────
-    with st.expander("🚀 Paso 5 — Calcular y descargar", expanded=True):
-        if "resultados_raw" not in st.session_state:
-            st.info("Completa los pasos anteriores primero.")
-        else:
-            if st.button("🔄 Calcular nómina", type="primary", use_container_width=True):
-                p_ini_dt = st.session_state["p_ini_dt"]
-                p_fin_dt = st.session_state["p_fin_dt"]
-                resultados_raw = st.session_state["resultados_raw"]
-                novedades_dict = st.session_state.get("novedades", {})
-
-                resultados_t = []
-                for emp in resultados_raw:
-                    col_db = get_colaborador_por_reloj(emp["nombre"], colaboradores_db)
-                    if col_db:
-                        sal  = col_db.salario_mensual if col_db.tipo == "empleado" else col_db.valor_hora_prestador
-                        tipo = col_db.tipo
-                    else:
-                        sal, tipo = 1423500, "empleado"
-                    novs = novedades_dict.get(emp["nombre"], [])
-                    t = calcular(emp, sal, tipo, novs)
-                    resultados_t.append((emp, t))
-
-                st.session_state["resultados_t"] = resultados_t
-                st.success("✅ Nómina calculada")
-
-            if "resultados_t" in st.session_state:
-                resultados_t = st.session_state["resultados_t"]
-                p_ini_dt = st.session_state["p_ini_dt"]
-                p_fin_dt = st.session_state["p_fin_dt"]
-
-                # ── Tabla resumen ──────────────────────────────────────────
-                st.subheader("Resumen de la quincena")
-                rows_res = []
-                gran_neto = 0
-                for emp, t in resultados_t:
-                    col_db = get_colaborador_por_reloj(emp["nombre"], colaboradores_db)
-                    if col_db and col_db.tipo == "prestador":
-                        neto = t["val_total_prest"]
-                    else:
-                        sal = col_db.salario_mensual if col_db else 1423500
-                        sal_q = sal / 2
-                        dias = t["dias_trab"]
-                        aux  = (249095/2) * dias / 15
-                        ibc  = sal_q + t["val_en"] + t["val_noct"]
-                        ded  = ibc * 0.08 + t["nov_deduccion"]
-                        neto = sal_q + aux + t["val_en"] + t["val_noct"] + t["nov_devengado"] - ded
-
-                    gran_neto += neto
-                    estado = (f"✅ +{t['en_h']:.1f}h extras" if t.get("en_h",0) > 0
-                              else f"⚠️ Debe {t['deu_h']:.1f}h" if t.get("deu_h",0) > 0.1
-                              else "✓ OK")
-                    novedades_txt = ", ".join([
-                        nd.get("desc","").split(" —")[0] for nd in t.get("nov_detalle",[])
-                    ]) or "—"
-                    rows_res.append({
-                        "Colaboradora": emp["nombre"],
-                        "Horas": f"{t['tot_h']:.1f}h",
-                        "H. Extras": f"{t.get('en_h',0):.1f}h",
-                        "Recargo Noct.": f"${t['val_noct']:,.0f}",
-                        "Novedades": novedades_txt,
-                        "Estado": estado,
-                        "Neto a pagar": f"${neto:,.0f}",
-                    })
-
-                st.dataframe(pd.DataFrame(rows_res), hide_index=True, use_container_width=True)
-
-                m1, m2, m3, m4 = st.columns(4)
-                m1.metric("Total neto", f"${gran_neto:,.0f}")
-                extras_ef = sum(t.get("val_ee",0) for _,t in resultados_t)
-                m2.metric("Extras efectivo", f"${extras_ef:,.0f}")
-                recargos  = sum(t.get("val_noct",0) for _,t in resultados_t)
-                m3.metric("Recargo nocturno", f"${recargos:,.0f}")
-                m4.metric("Colaboradoras", len(resultados_t))
-
-                st.divider()
-                st.subheader("Descargar archivos")
-
-                # ── Generar archivos ───────────────────────────────────────
-                tag = f"{p_ini_dt.strftime('%Y%m%d')}_{p_fin_dt.strftime('%Y%m%d')}"
-
-                col1, col2, col3, col4 = st.columns(4)
-
-                # 1. Colillas PDF
-                with col1:
-                    if st.button("📄 Generar colillas PDF", use_container_width=True):
-                        lista_colillas = []
-                        for emp, t in resultados_t:
-                            col_db = get_colaborador_por_reloj(emp["nombre"], colaboradores_db)
-                            if col_db:
-                                col_dict = {
-                                    "id": col_db.id, "nombre_completo": col_db.nombre_completo,
-                                    "cargo": col_db.cargo, "salario_mensual": col_db.salario_mensual,
-                                    "tipo": col_db.tipo, "banco": col_db.banco,
-                                    "cuenta": col_db.cuenta, "eps": col_db.eps,
-                                    "valor_hora_prestador": col_db.valor_hora_prestador,
-                                }
-                            else:
-                                col_dict = {
-                                    "id": emp["id"], "nombre_completo": emp["nombre"],
-                                    "cargo": "", "salario_mensual": t["salario"],
-                                    "tipo": t["tipo"], "banco": "", "cuenta": "", "eps": "",
-                                    "valor_hora_prestador": 0,
-                                }
-                            datos_colilla = calcular_conceptos_colilla(t, col_dict)
-                            lista_colillas.append(datos_colilla)
-
-                        pdf_bytes = generar_colilla_pdf(lista_colillas, p_ini_dt, p_fin_dt)
-                        st.download_button(
-                            "⬇️ Descargar colillas PDF",
-                            data=pdf_bytes,
-                            file_name=f"COLILLAS_{tag}.pdf",
-                            mime="application/pdf",
-                            use_container_width=True,
-                        )
-
-                # 2. Reporte horarios Excel
-                with col2:
-                    buf_rh = io.BytesIO()
-                    resultados_t_calc = []
-                    for emp, t in resultados_t:
-                        resultados_t_calc.append((emp, t))
-                    crear_reporte_horarios(resultados_t_calc, p_ini_dt, p_fin_dt,
-                                           f"/tmp/rh_{tag}.xlsx")
-                    with open(f"/tmp/rh_{tag}.xlsx", "rb") as f:
-                        rh_bytes = f.read()
-                    st.download_button(
-                        "⬇️ Reporte horarios",
-                        data=rh_bytes,
-                        file_name=f"REPORTE_HORARIOS_{tag}.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        use_container_width=True,
-                    )
-
-                # 3. Resumen nómina Excel
-                with col3:
-                    vd_sal = 1750905
-                    vd_q = vd_sal / 2
-                    vd_aux = 249095 / 2
-                    vd_ibc = vd_q
-                    vd_ded = vd_ibc * 0.08
-                    valentina_neto = vd_q + vd_aux - vd_ded
-
-                    crear_resumen_nomina(resultados_t_calc, valentina_neto, p_ini_dt, p_fin_dt,
-                                         f"/tmp/rn_{tag}.xlsx")
-                    with open(f"/tmp/rn_{tag}.xlsx", "rb") as f:
-                        rn_bytes = f.read()
-                    st.download_button(
-                        "⬇️ Resumen nómina",
-                        data=rn_bytes,
-                        file_name=f"RESUMEN_NOMINA_{tag}.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        use_container_width=True,
-                    )
-
-                # 4. ZIP con todo
-                with col4:
-                    if st.button("📦 Descargar todo (ZIP)", use_container_width=True):
-                        zip_buf = io.BytesIO()
-                        with zipfile.ZipFile(zip_buf, "w") as zf:
-                            zf.writestr(f"COLILLAS_{tag}.pdf", pdf_bytes if "pdf_bytes" in dir() else b"")
-                            zf.write(f"/tmp/rh_{tag}.xlsx", f"REPORTE_HORARIOS_{tag}.xlsx")
-                            zf.write(f"/tmp/rn_{tag}.xlsx", f"RESUMEN_NOMINA_{tag}.xlsx")
-                        st.download_button(
-                            "⬇️ Descargar ZIP",
-                            data=zip_buf.getvalue(),
-                            file_name=f"NOMINA_COMPLETA_{tag}.zip",
-                            mime="application/zip",
-                            use_container_width=True,
-                        )
-
-                # ── Guardar en histórico ───────────────────────────────────
-                st.divider()
-                if st.button("💾 Guardar esta quincena en el histórico", type="primary"):
-                    periodo_id = f"{p_ini_dt.strftime('%Y-%m-%d')}_{p_fin_dt.strftime('%Y-%m-%d')}"
-                    registro = {
-                        "id": periodo_id,
-                        "periodo_ini": p_ini_dt.strftime("%Y-%m-%d"),
-                        "periodo_fin": p_fin_dt.strftime("%Y-%m-%d"),
-                        "fecha_procesado": datetime.now().isoformat(),
-                        "total_nomina": gran_neto,
-                        "total_extras_ef": sum(t.get("val_ee",0) for _,t in resultados_t),
-                        "total_recargo": sum(t.get("val_noct",0) for _,t in resultados_t),
-                        "colaboradores": [
-                            {
-                                "nombre": emp["nombre"],
-                                "tot_h": t.get("tot_h",0), "noct_h": t.get("noct_h",0),
-                                "ext_h": t.get("en_h",0)+t.get("ee_h",0),
-                                "en_h": t.get("en_h",0), "ee_h": t.get("ee_h",0),
-                                "val_en": t.get("val_en",0), "val_ee": t.get("val_ee",0),
-                                "val_noct": t.get("val_noct",0), "val_deu": t.get("val_deu",0),
-                                "deu_h": t.get("deu_h",0), "dias_trab": t.get("dias_trab",0),
-                                "salario": t.get("salario",0), "tipo": t.get("tipo","empleado"),
-                                "val_total_prest": t.get("val_total_prest",0),
-                                "nov_devengado": t.get("nov_devengado",0),
-                                "nov_deduccion": t.get("nov_deduccion",0),
-                                "novedades_desc": " / ".join([
-                                    nd.get("desc","") for nd in t.get("nov_detalle",[])
-                                ]),
-                                "neto": next(
-                                    (neto for e2,t2 in resultados_t for neto in
-                                     [t2.get("val_total_prest",0) if t2.get("tipo")=="prestador"
-                                      else (t2.get("salario",0)/2*(t2.get("dias_trab",15)/15)
-                                            + (249095/2)*(t2.get("dias_trab",15)/15)
-                                            + t2.get("val_en",0)+t2.get("val_noct",0)
-                                            +t2.get("nov_devengado",0)
-                                            -(t2.get("salario",0)/2*(t2.get("dias_trab",15)/15)
-                                              +t2.get("val_en",0)+t2.get("val_noct",0))*0.08
-                                            -t2.get("nov_deduccion",0)
-                                      )]
-                                    if e2["nombre"] == emp["nombre"]),
-                                    0
-                                ),
-                            }
-                            for emp, t in resultados_t
-                        ],
-                    }
-                    guardar_quincena_historico(registro)
-                    st.success(f"✅ Quincena {periodo_id} guardada en el histórico")
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# MÓDULO 2 — COLABORADORES
-# ═══════════════════════════════════════════════════════════════════════════════
-elif "👥" in modulo:
-    st.title("👥 Colaboradores")
-    colaboradores_db = cargar_colaboradores()
-
-    tab_lista, tab_nuevo, tab_editar = st.tabs(["Lista del personal", "Agregar nuevo", "Editar / Retirar"])
-
-    with tab_lista:
-        st.subheader(f"Personal registrado ({len(colaboradores_db)} personas)")
-        rows = []
-        for c in colaboradores_db:
-            rows.append({
-                "Cédula": c.id,
-                "Nombre": c.nombre_completo,
-                "Nombre en reloj": c.nombre_reloj,
-                "Cargo": c.cargo,
-                "Salario mensual": f"${c.salario_mensual:,.0f}",
-                "Tipo": c.tipo.capitalize(),
-                "Fecha ingreso": c.fecha_ingreso,
-                "Fecha retiro": c.fecha_retiro or "—",
-                "Estado": "🟢 Activo" if c.activo else "🔴 Retirado",
-                "Banco": c.banco,
-                "Cuenta": c.cuenta,
-                "EPS": c.eps,
-            })
-        st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
-
-    with tab_nuevo:
-        st.subheader("Agregar nueva colaboradora")
-        with st.form("form_nuevo_col"):
-            c1, c2 = st.columns(2)
-            with c1:
-                ced     = st.text_input("Cédula *")
-                nombre  = st.text_input("Nombre completo * (como en colilla)")
-                n_reloj = st.text_input("Nombre en el reloj * (exacto)")
-                cargo   = st.text_input("Cargo")
-                ingreso = st.date_input("Fecha de ingreso", value=date.today())
-            with c2:
-                tipo     = st.selectbox("Tipo", ["empleado", "prestador"])
-                salario  = st.number_input("Salario mensual (COP)", min_value=0, value=1750905, step=10000)
-                vh_prest = st.number_input("Valor hora (solo prestador)", min_value=0, value=10000)
-                banco    = st.text_input("Banco", value="AHORROS DAVIVIENDA")
-                cuenta   = st.text_input("Número de cuenta")
-                eps      = st.text_input("EPS", value="SAVIA SALUD")
-
-            notas = st.text_area("Notas", height=60)
-
-            if st.form_submit_button("✅ Agregar colaboradora", type="primary"):
-                if not ced or not nombre or not n_reloj:
-                    st.error("Cédula, nombre completo y nombre en reloj son obligatorios.")
-                else:
-                    nuevo = Colaborador(
-                        id=ced.strip(), nombre_completo=nombre.strip(),
-                        nombre_reloj=n_reloj.strip(), cargo=cargo.strip(),
-                        salario_mensual=salario, fecha_ingreso=ingreso.isoformat(),
-                        fecha_retiro=None, banco=banco.strip(), cuenta=cuenta.strip(),
-                        eps=eps.strip(), tipo=tipo,
-                        valor_hora_prestador=vh_prest if tipo=="prestador" else 0,
-                        activo=True, notas=notas
-                    )
-                    if agregar_colaborador(nuevo):
-                        st.success(f"✅ {nombre} agregada correctamente")
-                        st.rerun()
-                    else:
-                        st.error(f"Ya existe una colaboradora con cédula {ced}")
-
-    with tab_editar:
-        st.subheader("Editar datos o registrar retiro")
-        nombres_todos = [f"{c.nombre_completo} ({c.id})" for c in colaboradores_db]
-        seleccion = st.selectbox("Selecciona colaboradora", nombres_todos)
-
-        if seleccion:
-            idx = nombres_todos.index(seleccion)
-            col_sel = colaboradores_db[idx]
-
-            with st.form("form_editar"):
-                c1, c2 = st.columns(2)
-                with c1:
-                    nuevo_nombre  = st.text_input("Nombre completo", value=col_sel.nombre_completo)
-                    nuevo_reloj   = st.text_input("Nombre en reloj", value=col_sel.nombre_reloj)
-                    nuevo_cargo   = st.text_input("Cargo", value=col_sel.cargo)
-                    nuevo_ingreso = st.date_input("Fecha ingreso",
-                                                   value=date.fromisoformat(col_sel.fecha_ingreso))
-                with c2:
-                    nuevo_salario = st.number_input("Salario mensual", value=int(col_sel.salario_mensual), step=10000)
-                    nuevo_banco   = st.text_input("Banco", value=col_sel.banco)
-                    nuevo_cuenta  = st.text_input("Cuenta", value=col_sel.cuenta)
-                    nuevo_eps     = st.text_input("EPS", value=col_sel.eps)
-                    nuevo_vh      = st.number_input("Valor hora prestador", value=int(col_sel.valor_hora_prestador))
-                nuevas_notas = st.text_area("Notas", value=col_sel.notas)
-
-                st.divider()
-                st.markdown("**Registrar retiro** (deja vacío si sigue activa)")
-                fecha_retiro_inp = st.date_input("Fecha de retiro",
-                                                  value=date.fromisoformat(col_sel.fecha_retiro) if col_sel.fecha_retiro else None)
-
-                c_save, c_retire = st.columns(2)
-                with c_save:
-                    if st.form_submit_button("💾 Guardar cambios", type="primary"):
-                        col_sel.nombre_completo   = nuevo_nombre
-                        col_sel.nombre_reloj      = nuevo_reloj
-                        col_sel.cargo             = nuevo_cargo
-                        col_sel.salario_mensual   = nuevo_salario
-                        col_sel.fecha_ingreso     = nuevo_ingreso.isoformat()
-                        col_sel.banco             = nuevo_banco
-                        col_sel.cuenta            = nuevo_cuenta
-                        col_sel.eps               = nuevo_eps
-                        col_sel.valor_hora_prestador = nuevo_vh
-                        col_sel.notas             = nuevas_notas
-                        actualizar_colaborador(col_sel)
-                        st.success("✅ Datos actualizados")
-                        st.rerun()
-                with c_retire:
-                    if st.form_submit_button("🔴 Registrar retiro", type="secondary"):
-                        if fecha_retiro_inp:
-                            retirar_colaborador(col_sel.id, fecha_retiro_inp.isoformat())
-                            st.success(f"✅ {col_sel.nombre_completo} retirada el {fecha_retiro_inp}")
-                            st.rerun()
-                        else:
-                            st.error("Selecciona la fecha de retiro")
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# MÓDULO 3 — HISTÓRICO
-# ═══════════════════════════════════════════════════════════════════════════════
-elif "📋" in modulo:
-    st.title("📋 Histórico de quincenas")
-    historico = cargar_historico()
-
-    if not historico:
-        st.info("Aún no hay quincenas guardadas. Procesa la primera quincena en el módulo de nómina.")
-    else:
-        # Resumen general
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Quincenas registradas", len(historico))
-        total_hist = sum(h.get("total_nomina", 0) for h in historico)
-        col2.metric("Total nómina histórica", f"${total_hist:,.0f}")
-        ultima = historico[0]
-        col3.metric("Última quincena", ultima.get("id", "—").replace("_", " al "))
-
-        st.divider()
-
-        # Lista de quincenas
-        st.subheader("Quincenas procesadas")
-        df_hist_res = pd.DataFrame([{
-            "Período": h.get("id","").replace("_"," al "),
-            "Fecha procesado": h.get("fecha_procesado","")[:10],
-            "Total nómina": f"${h.get('total_nomina',0):,.0f}",
-            "Extras efectivo": f"${h.get('total_extras_ef',0):,.0f}",
-            "Recargo nocturno": f"${h.get('total_recargo',0):,.0f}",
-            "Colaboradoras": len(h.get("colaboradores",[])),
-        } for h in historico])
-        st.dataframe(df_hist_res, hide_index=True, use_container_width=True)
-
-        # Detalle de una quincena
-        st.divider()
-        st.subheader("Ver detalle de una quincena")
-        opciones_q = [h.get("id","").replace("_"," al ") for h in historico]
-        sel_q = st.selectbox("Selecciona quincena", opciones_q)
-        if sel_q:
-            q_data = next((h for h in historico
-                           if h.get("id","").replace("_"," al ") == sel_q), None)
-            if q_data:
-                st.dataframe(pd.DataFrame([{
-                    "Nombre": c.get("nombre",""),
-                    "Horas": f"{c.get('tot_h',0):.1f}h",
-                    "H. Extras": f"{c.get('ext_h',0):.1f}h",
-                    "Recargo Noct.": f"${c.get('val_noct',0):,.0f}",
-                    "Novedades": c.get("novedades_desc","—") or "—",
-                    "Neto pagado": f"${c.get('neto',0):,.0f}",
-                } for c in q_data.get("colaboradores",[])]),
-                hide_index=True, use_container_width=True)
-
-        # Histórico por colaboradora
-        st.divider()
-        st.subheader("Histórico por colaboradora")
-        df_full = historico_a_dataframe()
-        if not df_full.empty:
-            colaboradoras = sorted(df_full["nombre"].unique())
-            sel_col = st.selectbox("Colaboradora", colaboradoras)
-            df_col = df_full[df_full["nombre"] == sel_col].copy()
-            df_col["horas_fmt"] = df_col["horas_trabajadas"].apply(lambda x: f"{x:.1f}h")
-            df_col["neto_fmt"]  = df_col["neto_pagado"].apply(lambda x: f"${x:,.0f}")
-            st.dataframe(df_col[["periodo","horas_fmt","horas_extras",
-                                   "val_recargo","neto_fmt","novedades"]].rename(columns={
-                "periodo":"Período","horas_fmt":"Horas","horas_extras":"H. Extras",
-                "val_recargo":"Recargo Noct.","neto_fmt":"Neto pagado","novedades":"Novedades"
-            }), hide_index=True, use_container_width=True)
-
-            # Exportar histórico
-            buf_hist = io.BytesIO()
-            df_col.to_excel(buf_hist, index=False)
-            st.download_button(
-                f"⬇️ Exportar histórico de {sel_col}",
-                data=buf_hist.getvalue(),
-                file_name=f"historico_{sel_col.replace(' ','_')}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# MÓDULO 4 — NÓMINA ELECTRÓNICA
-# ═══════════════════════════════════════════════════════════════════════════════
-elif "📊" in modulo:
-    st.title("📊 Nómina electrónica mensual")
-    st.caption("Genera el reporte mensual consolidando las dos quincenas — listo para Siigo.")
-
-    historico = cargar_historico()
-    colaboradores_db = cargar_colaboradores()
-
-    if not historico:
-        st.info("No hay quincenas guardadas. Procesa y guarda al menos una quincena primero.")
-    else:
-        # Seleccionar mes y año
-        c1, c2 = st.columns(2)
-        with c1:
-            anios_disponibles = sorted(set(
-                datetime.fromisoformat(h["periodo_ini"]).year
-                for h in historico
-            ), reverse=True)
-            anio_sel = st.selectbox("Año", anios_disponibles)
-        with c2:
-            MESES_NOMBRES = {1:"Enero",2:"Febrero",3:"Marzo",4:"Abril",5:"Mayo",6:"Junio",
-                             7:"Julio",8:"Agosto",9:"Septiembre",10:"Octubre",11:"Noviembre",12:"Diciembre"}
-            meses_con_data = sorted(set(
-                datetime.fromisoformat(h["periodo_ini"]).month
-                for h in historico
-                if datetime.fromisoformat(h["periodo_ini"]).year == anio_sel
-            ))
-            if meses_con_data:
-                mes_sel = st.selectbox("Mes", meses_con_data,
-                                        format_func=lambda m: MESES_NOMBRES[m])
+def _descartar_duplicados(marcaciones, ventana_min=10):
+    """
+    Elimina marcaciones con diferencia < ventana_min minutos del mismo tipo.
+    Ordena cronológicamente y guarda solo la primera de cada ráfaga.
+    """
+    if not marcaciones:
+        return marcaciones
+    ordenadas = sorted(marcaciones, key=lambda m: m['fecha'])
+    resultado = [ordenadas[0]]
+    for m in ordenadas[1:]:
+        diff = (m['fecha'] - resultado[-1]['fecha']).total_seconds() / 60
+        if m['estado'] == resultado[-1]['estado'] and diff < ventana_min:
+            continue  # duplicado — descartar
+        resultado.append(m)
+    return resultado
+
+
+def _parear_turnos(marcaciones_dia):
+    """
+    Dada una lista de marcaciones de un día (ya sin duplicados, ordenadas),
+    intenta parear E→S. Si una entrada no tiene salida o viceversa,
+    la deja con par=None y marca la alerta.
+    Retorna lista de turnos: [{'entrada': dt|None, 'salida': dt|None, 'alerta': str}]
+    """
+    turnos = []
+    i = 0
+    mlist = sorted(marcaciones_dia, key=lambda m: m['fecha'])
+
+    while i < len(mlist):
+        m = mlist[i]
+        if m['estado'] == 'Entrada':
+            # Buscar la siguiente Salida
+            if i + 1 < len(mlist) and mlist[i+1]['estado'] == 'Salida':
+                turnos.append({'entrada': m['fecha'], 'salida': mlist[i+1]['fecha'], 'alerta': ''})
+                i += 2
             else:
-                st.warning("No hay quincenas guardadas para este año.")
-                st.stop()
+                # Entrada sin salida
+                turnos.append({'entrada': m['fecha'], 'salida': None, 'alerta': 'sin_salida'})
+                i += 1
+        elif m['estado'] == 'Salida':
+            # Salida sin entrada previa
+            turnos.append({'entrada': None, 'salida': m['fecha'], 'alerta': 'sin_entrada'})
+            i += 1
+        else:
+            i += 1
 
-        # Verificar quincenas disponibles
-        q_mes = [h for h in historico
-                 if datetime.fromisoformat(h["periodo_ini"]).year == anio_sel
-                 and datetime.fromisoformat(h["periodo_ini"]).month == mes_sel]
-        q_mes.sort(key=lambda x: x["periodo_ini"])
+    return turnos
 
-        st.divider()
-        c1, c2 = st.columns(2)
-        with c1:
-            estado_q1 = "✅ Disponible" if len(q_mes) >= 1 else "❌ Falta"
-            st.metric("Quincena 1 (1-15)", estado_q1,
-                      delta=q_mes[0]["id"] if len(q_mes) >= 1 else None)
-        with c2:
-            estado_q2 = "✅ Disponible" if len(q_mes) >= 2 else "❌ Falta"
-            st.metric("Quincena 2 (16-31)", estado_q2,
-                      delta=q_mes[1]["id"] if len(q_mes) >= 2 else None)
 
-        if len(q_mes) < 2:
-            st.warning(f"Faltan quincenas para {MESES_NOMBRES[mes_sel]} {anio_sel}. "
-                       "Procesa y guarda ambas quincenas del mes.")
+def _calcular_turno(entrada, salida, hora_noct_ini=HORA_NOCT_INI):
+    """Calcula horas trabajadas y recargo nocturno de un turno."""
+    if not entrada or not salida or salida <= entrada:
+        return 0.0, 0.0
+    trab = (salida - entrada).total_seconds() / 86400
+    ns = entrada.replace(hour=hora_noct_ini, minute=0, second=0)
+    # Si la salida cruza medianoche el recargo se calcula correctamente igual
+    noct = max(0.0, (salida - max(entrada, ns)).total_seconds() / 86400) if salida > ns else 0.0
+    return trab, noct
 
-        if st.button("📊 Generar nómina electrónica del mes", type="primary",
-                     disabled=len(q_mes) < 1):
-            with st.spinner("Generando Excel..."):
-                # Preparar datos del mes
-                datos_mes = preparar_datos_mes_desde_historico(
-                    historico, mes_sel, anio_sel, colaboradores_db
-                )
-                meses_data = {mes_sel: datos_mes}
-                xlsx_bytes = generar_nomina_electronica_xlsx(meses_data, anio_sel)
 
-            nombre_mes = MESES_NOMBRES[mes_sel].upper()
-            st.download_button(
-                f"⬇️ Descargar NOMINA_ELECTRONICA_{nombre_mes}_{anio_sel}.xlsx",
-                data=xlsx_bytes,
-                file_name=f"NOMINA_ELECTRONICA_{nombre_mes}_{anio_sel}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
+def procesar(df, p_ini, p_fin):
+    """
+    Procesa el DataFrame del reloj biométrico.
+    Soporta múltiples turnos por día, elimina duplicados < 10 min,
+    y calcula recargo nocturno por turno.
+    """
+    by_emp = {}
+    for _, row in df.iterrows():
+        try: fecha = parse_date(str(row['Tiempo']))
+        except: continue
+        num = str(row.get('Número', row.get('Numero', ''))).strip()
+        nom = str(row.get('Nombre', '')).strip()
+        est = str(row.get('Estado', '')).strip()
+        # Ignorar marcaciones con nombre vacío
+        if not nom: continue
+        k = f"{num}_{nom}"
+        if k not in by_emp:
+            by_emp[k] = {'id': num, 'nombre': nom, 'marcaciones': []}
+        by_emp[k]['marcaciones'].append({'fecha': fecha, 'estado': est, 'id_marca': len(by_emp[k]['marcaciones'])})
+
+    resultados = []
+    for k, emp in by_emp.items():
+        # Agrupar marcaciones por día
+        dias_map = {}
+        for m in emp['marcaciones']:
+            dk = m['fecha'].strftime('%Y-%m-%d')
+            if dk not in dias_map:
+                dias_map[dk] = []
+            dias_map[dk].append(m)
+
+        # Para cada día del período
+        dias = []
+        cur = p_ini
+        while cur <= p_fin:
+            dk = cur.strftime('%Y-%m-%d')
+            raw_dia = dias_map.get(dk, [])
+
+            # Manejar salidas en madrugada del día siguiente
+            nk = (cur + timedelta(1)).strftime('%Y-%m-%d')
+            raw_siguiente = dias_map.get(nk, [])
+            madrugada = [m for m in raw_siguiente
+                         if m['estado'] == 'Salida' and m['fecha'].hour < HORA_MADRUGADA]
+
+            todas_marcaciones = raw_dia + madrugada
+
+            if not todas_marcaciones:
+                dias.append({
+                    'fecha': cur, 'dk': dk,
+                    'turnos': [],        # lista de turnos del día
+                    'entrada': None,     # compatibilidad — primer turno
+                    'salida': None,
+                    'ef': 'ok', 'sf': 'ok',
+                    'trab': 0.0, 'noct': 0.0,
+                    'tiene': False,
+                    'marcaciones_raw': [],  # para el preinforme editable
+                })
+            else:
+                # Descartar duplicados
+                sin_dup = _descartar_duplicados(todas_marcaciones, ventana_min=10)
+                # Parear turnos
+                turnos = _parear_turnos(sin_dup)
+
+                # Calcular horas totales sumando todos los turnos
+                trab_total = 0.0
+                noct_total = 0.0
+                alertas    = []
+                for t in turnos:
+                    if t['alerta']:
+                        alertas.append(t['alerta'])
+                    else:
+                        tr, nr = _calcular_turno(t['entrada'], t['salida'])
+                        trab_total += tr
+                        noct_total += nr
+
+                # Primera entrada / última salida para compatibilidad con colilla
+                entradas = [t['entrada'] for t in turnos if t['entrada']]
+                salidas  = [t['salida']  for t in turnos if t['salida']]
+                primera_entrada = min(entradas) if entradas else None
+                ultima_salida   = max(salidas)  if salidas  else None
+
+                ef = 'missing' if 'sin_entrada' in alertas else 'ok'
+                sf = 'missing' if 'sin_salida'  in alertas else 'ok'
+
+                dias.append({
+                    'fecha': cur, 'dk': dk,
+                    'turnos': turnos,
+                    'entrada': primera_entrada,
+                    'salida':  ultima_salida,
+                    'ef': ef, 'sf': sf,
+                    'trab': trab_total,
+                    'noct': noct_total,
+                    'tiene': True,
+                    'marcaciones_raw': sin_dup,  # para edición en preinforme
+                })
+            cur += timedelta(1)
+
+        resultados.append({**emp, 'dias': dias})
+
+    return resultados
+
+
+def calcular_novedad(salario, tipo, dias, pct_override=None):
+    """Calcula el valor de una novedad. Retorna (devengado, deduccion, descripcion)"""
+    TIPOS = {
+        'INC_EPS':  ('Incapacidad EPS',               True,  True,  66.66, False),
+        'INC_ARL':  ('Incapacidad ARL',                True,  False, 100.0, False),
+        'MAT_PAT':  ('Licencia maternidad/paternidad', True,  False, 100.0, False),
+        'LIC_REM':  ('Licencia remunerada',            True,  False, 100.0, False),
+        'LIC_NREM': ('Licencia no remunerada',         True,  False, 0.0,   True),
+        'VACAC':    ('Vacaciones',                     True,  False, 100.0, False),
+        'DIA_FAM':  ('Día de la familia',              True,  False, 100.0, False),
+        'COMPENS':  ('Día compensatorio',              True,  False, 0.0,   False),
+        'CALAM':    ('Calamidad doméstica',            True,  False, 100.0, False),
+        'SUSPEND':  ('Suspensión disciplinaria',       True,  False, 0.0,   True),
+        'AUS_INJ':  ('Ausencia injustificada',         True,  False, 0.0,   True),
+        'RENUNCIA': ('Liquidación por renuncia',       True,  False, 100.0, False),
+        'INGRESO':  ('Ingreso parcial período',        True,  False, 100.0, False),
+    }
+    cfg = TIPOS.get(tipo)
+    if not cfg:
+        return (0, 0, f'Novedad desconocida: {tipo}')
+    desc, afecta, req_pct, pct_def, es_ded = cfg
+    pct = pct_override if pct_override is not None else pct_def
+    valor_dia = salario / 30
+    if tipo == 'COMPENS':
+        return (0, 0, f'{desc} — {dias} día(s) — Justificado sin pago adicional')
+    elif tipo in ['RENUNCIA', 'INGRESO']:
+        # Solo es informativo — el cálculo proporcional ya está en los días trabajados
+        return (0, 0, f'{desc} — {dias} día(s) trabajado(s) en el período')
+    elif es_ded:
+        val = valor_dia * dias
+        return (0, val, f'{desc} — {dias} día(s) — Descuento: ${val:,.0f}')
+    else:
+        val = valor_dia * dias * (pct / 100)
+        return (val, 0, f'{desc} — {dias} día(s) al {pct:.2f}% — Pago: ${val:,.0f}')
+
+
+def calcular(emp, salario, tipo="empleado", novedades_emp=None):
+    """
+    tipo='empleado'  → contrato laboral, salario/220 = valor hora, deducciones salud/pension
+    tipo='prestador' → salario = valor_hora fijo (ej $10,000/h), sin deducciones
+    novedades_emp    → lista de dicts [{'tipo':..., 'dias':..., 'pct':..., 'valor_override':...}]
+    """
+    QDIA = HORAS_QUINCENA / 24
+    MAXE = MAX_EXTRAS_NOM / 24
+
+    if tipo == "prestador":
+        vh = salario
+    else:
+        vh = salario / HORAS_MES
+
+    tot  = sum(d['trab'] for d in emp['dias'])
+    noct = sum(d['noct'] for d in emp['dias'])
+
+    if tipo == "prestador":
+        ext  = 0.0
+        deu  = 0.0
+        en   = 0.0
+        ee   = 0.0
+        val_total_prest = tot * 24 * vh
+    else:
+        ext  = max(0.0, tot - QDIA)
+        deu  = max(0.0, QDIA - tot)
+        en   = min(ext, MAXE)
+        ee   = max(0.0, ext - MAXE)
+        val_total_prest = 0.0
+
+    dias_trab = sum(1 for d in emp['dias'] if d['trab'] > 0)
+
+    # ── Calcular novedades ─────────────────────────────────────────────────────
+    nov_devengado = 0.0
+    nov_deduccion = 0.0
+    nov_detalle   = []
+    if novedades_emp:
+        for nov in novedades_emp:
+            dev, ded, desc = calcular_novedad(
+                salario, nov.get('tipo',''), nov.get('dias', 1),
+                nov.get('pct')
             )
-            st.success("✅ Archivo generado. Ábrelo y pasa los datos a Siigo.")
+            if nov.get('valor_override') is not None:
+                if dev > 0: dev = float(nov['valor_override']); ded = 0
+                else:       ded = float(nov['valor_override']); dev = 0
+                desc = desc.split(' — Pago:')[0] + f" — Valor ajustado: ${nov['valor_override']:,.0f}"
+            nov_devengado += dev
+            nov_deduccion += ded
+            nov_detalle.append({
+                'tipo': nov.get('tipo',''), 'dias': nov.get('dias',1),
+                'pct': nov.get('pct'), 'devengado': dev,
+                'deduccion': ded, 'desc': desc
+            })
 
-        # Opción: generar todo el año
-        st.divider()
-        if st.button("📅 Generar nómina electrónica año completo"):
-            with st.spinner("Generando Excel anual..."):
-                meses_con_data_anio = sorted(set(
-                    datetime.fromisoformat(h["periodo_ini"]).month
-                    for h in historico
-                    if datetime.fromisoformat(h["periodo_ini"]).year == anio_sel
-                ))
-                meses_data_anio = {}
-                for m in meses_con_data_anio:
-                    meses_data_anio[m] = preparar_datos_mes_desde_historico(
-                        historico, m, anio_sel, colaboradores_db
-                    )
-                xlsx_anual = generar_nomina_electronica_xlsx(meses_data_anio, anio_sel)
+    return dict(salario=salario, vh=vh, tipo=tipo,
+                tot=tot, noct=noct, ext=ext, deu=deu,
+                en=en, ee=ee,
+                en_h=en*24, ee_h=ee*24, noct_h=noct*24,
+                deu_h=deu*24, tot_h=tot*24,
+                val_en=en*24*vh*FACTOR_EXTRA,
+                val_ee=ee*24*vh*FACTOR_EXTRA,
+                val_noct=noct*24*vh*FACTOR_NOCT,
+                val_deu=deu*24*vh,
+                val_total_prest=val_total_prest,
+                dias_trab=dias_trab,
+                nov_devengado=nov_devengado,
+                nov_deduccion=nov_deduccion,
+                nov_detalle=nov_detalle)
 
-            st.download_button(
-                f"⬇️ NOMINA_ELECTRONICA_{anio_sel}_COMPLETA.xlsx",
-                data=xlsx_anual,
-                file_name=f"NOMINA_ELECTRONICA_{anio_sel}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-            )
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  REPORTE HORARIOS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def hoja_empleado_horario(wb, emp, t, p_ini, p_fin):
+    nom = emp['nombre']
+    ws = wb.create_sheet(title=nom.split()[-1][:10].upper())
+    ws.sheet_view.showGridLines = False
+    DIAS = ["Lun","Mar","Mié","Jue","Vie","Sáb","Dom"]
+
+    # Título
+    ws.merge_cells("A1:K1")
+    c = ws["A1"]; c.value = f"REPORTE DE HORARIOS — {nom.upper()}"
+    c.font = fnt(bold=True, color="FFFFFF", size=12)
+    c.fill = fill(C['h1']); c.alignment = aln("center")
+    ws.row_dimensions[1].height = 24
+
+    ws.merge_cells("A2:C2"); ws["A2"].value = "Nombre"
+    ws["A2"].font = fnt(bold=True); ws["A2"].fill = fill(C['alt'])
+    ws.merge_cells("D2:K2"); ws["D2"].value = nom
+    ws["D2"].font = fnt(bold=True, color=C['h2']); ws["D2"].fill = fill(C['alt'])
+
+    hdrs = ["ID","Fecha","Turno","Entrada","Salida","Red. Ent.","Red. Sal.","Trabajado","T/T","Descanso","RECARGO\nNOCT."]
+    for col, h in enumerate(hdrs, 1):
+        c = sc(ws, 3, col, h, bold=True, bg=C['h2'], fc="FFFFFF", ha="center")
+        c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    ws.row_dimensions[3].height = 28
+
+    fila = 4
+    for i, d in enumerate(emp['dias']):
+        bg = C['alt'] if i % 2 == 0 else C['blanco']
+        if d['tiene'] and (d['ef'] == 'missing' or d['sf'] == 'missing'):
+            bg = C['naranja']
+
+        eid = int(emp['id']) if emp['id'].isdigit() else emp['id']
+        sc(ws, fila, 1, eid, bg=bg, ha="center")
+        sc(ws, fila, 2, d['fecha'], bg=bg, ha="center", fmt="DD/MM/YYYY")
+        sc(ws, fila, 3, "HORARIO FLEXIBLE(00:00-23:59)", bg=bg)
+
+        if not d['tiene']:
+            sc(ws, fila, 4, "DESCANSO", bg=C['amarillo'], ha="center", bold=True)
+            for col in range(5, 12): sc(ws, fila, col, "", bg=bg)
+        else:
+            e_str = frac_to_hm(dt_frac(d['entrada'])) if d['ef']=='ok' else "00:00 ⚠"
+            s_str = frac_to_hm(dt_frac(d['salida']))  if d['sf']=='ok' else "00:00 ⚠"
+            sc(ws, fila, 4, e_str, bg=bg if d['ef']=='ok' else C['naranja'], ha="center",
+               fc="000000" if d['ef']=='ok' else "FFFFFF", bold=(d['ef']!='ok'))
+            sc(ws, fila, 5, s_str, bg=bg if d['sf']=='ok' else C['naranja'], ha="center",
+               fc="000000" if d['sf']=='ok' else "FFFFFF", bold=(d['sf']!='ok'))
+            for col in [6, 7, 9, 10]: sc(ws, fila, col, "", bg=bg)
+            sc(ws, fila, 8, round(d['trab'], 8), bg=bg, ha="center", fmt="0.00000000")
+            nv = round(d['noct'], 8) if d['noct'] > 0 else ""
+            sc(ws, fila, 11, nv, bg=C['azul_c'] if d['noct']>0 else bg, ha="center",
+               fmt="0.00000000" if d['noct']>0 else None)
+        ws.row_dimensions[fila].height = 15
+        fila += 1
+
+    # Totales
+    for col, v in enumerate(["","","TOTAL HORAS LABORADAS","","","","",
+                               round(t['tot'],8),"RECARGO NOCTURNO","",round(t['noct'],8)], 1):
+        c = sc(ws, fila, col, v, bold=True, bg=C['h1'], fc="FFFFFF",
+               ha="center" if col in [4,8,11] else "left",
+               fmt="0.00000000" if col in [8,11] else None)
+    ws.row_dimensions[fila].height = 18; fila += 1
+
+    for col, v in enumerate(["","","HORAS QUE DEBE","","","","",
+                               round(t['deu'],8) if t['deu']>0.0001 else 0,
+                               "RECARGO QUE DEBE","",0], 1):
+        sc(ws, fila, col, v, bold=(col in [3,9]), bg=C['rojo_c'],
+           ha="center" if col in [8,11] else "left",
+           fmt="0.00000000" if col in [8,11] else None)
+    fila += 1
+
+    for col, v in enumerate(["","","TOTAL","","","","",
+                               round(t['tot'],8),"TOTAL","",round(t['noct'],8)], 1):
+        sc(ws, fila, col, v, bold=(col in [3,9]), bg=C['verde_c'],
+           ha="center" if col in [8,11] else "left",
+           fmt="0.00000000" if col in [8,11] else None)
+    fila += 2
+
+    QDIA = HORAS_QUINCENA / 24
+    # Bloque quincena/extras
+    def mk(r, c1, l1, c2, v2, bgL=C['azul_c'], bgV=C['blanco'], fmt=None, boldV=False):
+        sc(ws, r, c1, l1, bold=True, bg=bgL, b=True)
+        ws.merge_cells(start_row=r, start_column=c1, end_row=r, end_column=c1+1)
+        sc(ws, r, c2, v2, bg=bgV, ha="right", fmt=fmt, bold=boldV)
+
+    mk(fila, 2, "HORAS POR QUINCENA", 4, "", bgV=C['azul_c'])
+    sc(ws, fila, 5, "HORAS QUE DEBE", bold=True, bg=C['rojo_c'])
+    ws.merge_cells(start_row=fila, start_column=5, end_row=fila, end_column=7)
+    deuda_disp = -round(t['ext'],8) if t['ext']>0 else round(t['deu'],8)
+    sc(ws, fila, 8, deuda_disp, bold=True,
+       bg=C['rojo_c'] if t['deu']>0 else C['verde_c'], ha="right", fmt="0.00000000")
+    fila += 1
+    sc(ws, fila, 2, round(QDIA, 8), bold=True, bg=C['azul_c'], ha="right", fmt="0.00000000")
+    sc(ws, fila, 5, "HORAS EXTRAS", bold=True, bg=C['verde_c'])
+    ws.merge_cells(start_row=fila, start_column=5, end_row=fila, end_column=7)
+    sc(ws, fila, 8, round(t['ext'],8), bold=True, bg=C['verde_c'], ha="right", fmt="0.00000000")
+    fila += 1
+    sc(ws, fila, 2, "SUELDO", bold=True, bg=C['azul_c'])
+    ws.merge_cells(start_row=fila, start_column=2, end_row=fila, end_column=3)
+    fila += 1
+    sc(ws, fila, 2, t['salario'], bold=True, ha="right", fmt="$#,##0")
+    fila += 2
+
+    # Tabla horas extras
+    for col, h in enumerate(["","HORAS EXTRAS","","TIEMPO (días)","VALOR"], 1):
+        sc(ws, fila, col, h, bold=True, bg=C['h2'], fc="FFFFFF", ha="center")
+    fila += 1
+    for lbl, td, val, bgc in [
+        ("SE PAGAN EN COLILLA DE PAGO", t['en'], t['val_en'], C['verde_c']),
+        ("SE PAGA EN EFECTIVO",         t['ee'], t['val_ee'], C['amarillo']),
+    ]:
+        sc(ws, fila, 2, lbl, bg=bgc)
+        ws.merge_cells(start_row=fila, start_column=2, end_row=fila, end_column=3)
+        sc(ws, fila, 4, round(td,8) if td else 0, bg=bgc, ha="right", fmt="0.00000000")
+        sc(ws, fila, 5, round(val) if val else 0, bg=bgc, ha="right", fmt="$#,##0")
+        ws.row_dimensions[fila].height = 15; fila += 1
+    fila += 1
+
+    # Tabla conceptos
+    for col, h in enumerate(["","CONCEPTO","","VALOR HORA","TIEMPO (h)","TOTAL"], 1):
+        sc(ws, fila, col, h, bold=True, bg=C['h1'], fc="FFFFFF", ha="center")
+    fila += 1
+    for lbl, vh_f, th, total, bgc in [
+        ("Hora extra diurna",  t['vh']*FACTOR_EXTRA, t['ext']*24, t['val_en']+t['val_ee'], C['alt']),
+        ("Recargo nocturno",   t['vh']*FACTOR_NOCT,  t['noct_h'],  t['val_noct'],           C['azul_c']),
+    ]:
+        sc(ws, fila, 2, lbl, bg=bgc)
+        ws.merge_cells(start_row=fila, start_column=2, end_row=fila, end_column=3)
+        sc(ws, fila, 4, round(vh_f,10), bg=bgc, ha="right", fmt="0.0000000000")
+        sc(ws, fila, 5, round(th,8),    bg=bgc, ha="right", fmt="0.00000000")
+        sc(ws, fila, 6, round(total),   bg=bgc, ha="right", fmt="$#,##0")
+        ws.row_dimensions[fila].height = 15; fila += 1
+    sc(ws, fila, 5, "TOTAL", bold=True, bg=C['h1'], fc="FFFFFF", ha="right")
+    sc(ws, fila, 6, round(t['val_en']+t['val_ee']+t['val_noct']), bold=True,
+       bg=C['h1'], fc="FFFFFF", ha="right", fmt="$#,##0")
+    ws.row_dimensions[fila].height = 18; fila += 2
+
+    # Novedades
+    for col, h in enumerate(["","NOVEDAD","","DÍAS","% PAGO","VALOR"], 1):
+        sc(ws, fila, col, h, bold=True, bg=C['h2'], fc="FFFFFF", ha="center")
+    fila += 1
+    for nov in ["Incapacidad (0% / 66.66% / 100%)", "Licencia no remunerada",
+                "Vacaciones", "Día de la familia / compensatorio"]:
+        sc(ws, fila, 2, nov, bg=C['amarillo'])
+        ws.merge_cells(start_row=fila, start_column=2, end_row=fila, end_column=3)
+        sc(ws, fila, 4, 0,      bg=C['amarillo'], ha="center")
+        sc(ws, fila, 5, "100%", bg=C['amarillo'], ha="center")
+        sc(ws, fila, 6, 0,      bg=C['amarillo'], ha="right", fmt="$#,##0")
+        ws.row_dimensions[fila].height = 15; fila += 1
+
+    widths = [4, 8, 24, 10, 10, 11, 11, 14, 10, 12, 14]
+    for i, w in enumerate(widths, 1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+    ws.freeze_panes = "A4"
+
+
+def crear_reporte_horarios(resultados_t, p_ini, p_fin, nombre_out):
+    wb = openpyxl.Workbook(); wb.remove(wb.active)
+
+    # ── Hoja resumen ──
+    ws = wb.create_sheet("RESUMEN NOMINA", 0)
+    ws.sheet_view.showGridLines = False
+    ws.merge_cells("A1:L1")
+    c = ws["A1"]; c.value = f"RESUMEN DE NÓMINA — {p_ini.strftime('%d/%m/%Y')} AL {p_fin.strftime('%d/%m/%Y')}"
+    c.font = fnt(bold=True, color="FFFFFF", size=13); c.fill = fill(C['h1']); c.alignment = aln("center")
+    ws.row_dimensions[1].height = 28
+
+    hdrs = ["Nombre","Salario\nMensual","Total H.\nTrabajadas","Horas\nExtras",
+            "Ext.\nNómina","Ext.\nEfectivo","H. Recargo\nNocturno","H.\nDebe",
+            "Valor Ext.\nNómina","Valor Ext.\nEfectivo","Valor\nRecargo","TOTAL\nQUINCENA"]
+    for col, h in enumerate(hdrs, 1):
+        c = sc(ws, 2, col, h, bold=True, bg=C['h2'], fc="FFFFFF", ha="center")
+        c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    ws.row_dimensions[2].height = 30
+
+    for i, (emp, t) in enumerate(resultados_t):
+        r = i + 3; bg = C['alt'] if i % 2 == 0 else C['blanco']
+        total_q = (t['salario']/2) + t['val_en'] + t['val_noct'] - t['val_deu']
+        vals = [emp['nombre'], t['salario'], round(t['tot_h'],2), round(t['ext']*24,2),
+                round(t['en_h'],2), round(t['ee_h'],2), round(t['noct_h'],2), round(t['deu_h'],2),
+                round(t['val_en']), round(t['val_ee']), round(t['val_noct']), round(total_q)]
+        fmts = [None,'$#,##0','0.00','0.00','0.00','0.00','0.00','0.00',
+                '$#,##0','$#,##0','$#,##0','$#,##0']
+        for col, (v, fm) in enumerate(zip(vals, fmts), 1):
+            cbg = bg
+            if col == 4 and t['ext'] > 0: cbg = C['verde_c']
+            if col == 8 and t['deu_h'] > 0.1: cbg = C['rojo_c']
+            sc(ws, r, col, v, bg=cbg, ha="right" if col > 1 else "left", fmt=fm)
+        ws.row_dimensions[r].height = 15
+
+    n = len(resultados_t); tr = n + 3
+    sc(ws, tr, 1, "TOTALES", bold=True, bg=C['h1'], fc="FFFFFF")
+    for col in range(2, 13):
+        lt = get_column_letter(col)
+        fm = '$#,##0' if col in [2,9,10,11,12] else '0.00'
+        c = ws.cell(tr, col, value=f"=SUM({lt}3:{lt}{tr-1})")
+        c.font = fnt(bold=True, color="FFFFFF"); c.fill = fill(C['h1'])
+        c.alignment = aln("right"); c.border = thin(); c.number_format = fm
+    ws.row_dimensions[tr].height = 18
+    for i, w in enumerate([26,13,12,10,10,10,13,10,14,14,13,14], 1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+    ws.freeze_panes = "A3"
+
+    # ── Hoja extras/recargos ──
+    ws2 = wb.create_sheet("HORAS EXTRAS Y RECARGOS")
+    ws2.sheet_view.showGridLines = False
+    ws2.merge_cells("A1:I1")
+    c = ws2["A1"]; c.value = "RESUMEN HORAS EXTRAS, RECARGO NOCTURNO Y TIEMPO ADEUDADO"
+    c.font = fnt(bold=True, color="FFFFFF", size=12); c.fill = fill(C['h1']); c.alignment = aln("center")
+    ws2.row_dimensions[1].height = 24
+    hdrs2 = ["Nombre","H. Extras\nNómina","Valor\nExtras Nom.","H. Extras\nEfectivo",
+             "Valor\nExtras Ef.","H. Recargo\nNocturno","Valor\nRecargo Noct.","H. Adeudadas","Valor\nAdeudo"]
+    for col, h in enumerate(hdrs2, 1):
+        c = sc(ws2, 2, col, h, bold=True, bg=C['h2'], fc="FFFFFF", ha="center")
+        c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    ws2.row_dimensions[2].height = 30
+    for i, (emp, t) in enumerate(resultados_t):
+        r = i + 3; bg = C['alt'] if i % 2 == 0 else C['blanco']
+        vals = [emp['nombre'], round(t['en_h'],2), round(t['val_en']), round(t['ee_h'],2),
+                round(t['val_ee']), round(t['noct_h'],2), round(t['val_noct']),
+                round(t['deu_h'],2), round(t['val_deu'])]
+        fmts = [None,'0.00','$#,##0','0.00','$#,##0','0.00','$#,##0','0.00','$#,##0']
+        for col, (v, fm) in enumerate(zip(vals, fmts), 1):
+            cbg = bg
+            if col == 2 and t['en_h'] > 0: cbg = C['verde_c']
+            if col == 4 and t['ee_h'] > 0: cbg = C['amarillo']
+            if col == 8 and t['deu_h'] > 0.1: cbg = C['rojo_c']
+            sc(ws2, r, col, v, bg=cbg, ha="right" if col > 1 else "left", fmt=fm)
+        ws2.row_dimensions[r].height = 15
+    n2 = len(resultados_t); tr2 = n2 + 3
+    sc(ws2, tr2, 1, "TOTALES", bold=True, bg=C['h1'], fc="FFFFFF")
+    for col in range(2, 10):
+        lt = get_column_letter(col)
+        fm = '$#,##0' if col in [3,5,7,9] else '0.00'
+        c = ws2.cell(tr2, col, value=f"=SUM({lt}3:{lt}{tr2-1})")
+        c.font = fnt(bold=True, color="FFFFFF"); c.fill = fill(C['h1'])
+        c.alignment = aln("right"); c.border = thin(); c.number_format = fm
+    for i, w in enumerate([26,11,15,12,15,13,16,11,14], 1):
+        ws2.column_dimensions[get_column_letter(i)].width = w
+    ws2.freeze_panes = "A3"
+
+    # ── Hojas individuales ──
+    for emp, t in resultados_t:
+        hoja_empleado_horario(wb, emp, t, p_ini, p_fin)
+
+    wb.save(nombre_out)
+    print(f"✅ {nombre_out}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  COLILLA DE PAGO
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def colilla_empleado(wb, emp, t, p_ini, p_fin, datos_col):
+    cedula, nombre_completo, cargo, banco, cuenta, eps, _, tipo_col = datos_col
+    sal = t['salario']
+    AUX_Q = AUXILIO_TRANSPORTE_ANUAL / 2
+    dias_trab = t['dias_trab']
+
+    if tipo_col == "prestador":
+        # Prestador: pago por horas, sin auxilio transporte ni deducciones
+        sal_q     = 0
+        aux_transp = 0
+        dev_ext   = 0
+        dev_noct  = 0
+        pension   = 0
+        salud     = 0
+        total_dev = t['val_total_prest']
+        total_ded = 0
+        neto      = total_dev
+        # Para mostrar en la colilla el concepto correcto
+        cant_prest = round(t['tot_h'], 10)
+    else:
+        aux_transp = AUX_Q * dias_trab / 15
+        sal_q     = sal / 2
+        dev_ext   = t['val_en']
+        dev_noct  = t['val_noct']
+        ibc       = sal_q + dev_ext + dev_noct
+        pension   = ibc * PENSION_PCT
+        salud     = ibc * SALUD_PCT
+        total_dev = sal_q + aux_transp + dev_ext + dev_noct
+        total_ded = pension + salud
+        neto      = total_dev - total_ded
+        cant_prest = 0
+
+    # Fechas
+    serial_hoy = date_serial(datetime.now())
+    serial_ini = date_serial(p_ini)
+    serial_fin = date_serial(p_fin)
+    mes = p_ini.month
+    anio = p_ini.year
+
+    nom_hoja = nombre_completo.split()[0][:10].upper()
+    # Avoid duplicate sheet names
+    base = nom_hoja; i = 1
+    while base in [ws.title for ws in wb.worksheets]:
+        base = f"{nom_hoja}{i}"; i += 1
+    ws = wb.create_sheet(title=base)
+    ws.sheet_view.showGridLines = False
+
+    # ── Colilla se imprime DOS VECES en la misma hoja ──
+    for bloque in range(2):
+        R = bloque * 22 + 1  # fila de inicio de cada bloque
+
+        def line(row, col, v, bold=False, bg=None, fc="000000", ha="left",
+                 fmt=None, merge_end=None, b=True, size=9):
+            r = R + row
+            c = sc(ws, r, col, v, bold=bold, bg=bg, fc=fc, ha=ha,
+                   fmt=fmt, b=b, size=size)
+            if merge_end:
+                ws.merge_cells(start_row=r, start_column=col, end_row=r, end_column=merge_end)
+            return c
+
+        # ── Header empresa ──
+        ws.row_dimensions[R].height = 20
+        line(0, 1, f"{EMPRESA['nombre']}  NIT: {EMPRESA['nit']}  DIR: {EMPRESA['dir']}  TEL: {EMPRESA['tel']}",
+             bold=True, bg=C['col_h'], fc="FFFFFF", ha="left", merge_end=11, size=9)
+        ws.cell(R, 12).value = serial_hoy
+        ws.cell(R, 12).number_format = "DD/MM/YYYY"
+        ws.cell(R, 12).font = fnt(bold=True, color="FFFFFF", size=9)
+        ws.cell(R, 12).fill = fill(C['col_h'])
+        ws.cell(R, 12).alignment = aln("right")
+        ws.cell(R, 12).border = thin()
+
+        # ── Fila periodo ──
+        ws.row_dimensions[R+1].height = 16
+        line(1, 1, "Periodo", bold=True, bg=C['col_sub'], fc="FFFFFF", size=9)
+        ws.cell(R+1, 2).value = mes
+        ws.cell(R+1, 2).font = fnt(bold=True, color="FFFFFF", size=9)
+        ws.cell(R+1, 2).fill = fill(C['col_sub']); ws.cell(R+1, 2).border = thin()
+        ws.cell(R+1, 3).value = anio
+        ws.cell(R+1, 3).font = fnt(bold=True, color="FFFFFF", size=9)
+        ws.cell(R+1, 3).fill = fill(C['col_sub']); ws.cell(R+1, 3).border = thin()
+
+        line(1, 4, "Nómina Entre", bold=True, bg=C['col_sub'], fc="FFFFFF", size=9)
+        ws.cell(R+1, 5).value = serial_ini
+        ws.cell(R+1, 5).number_format = "DD/MM/YYYY"
+        ws.cell(R+1, 5).font = fnt(color="FFFFFF", size=9)
+        ws.cell(R+1, 5).fill = fill(C['col_sub']); ws.cell(R+1, 5).border = thin()
+        line(1, 6, "y", bg=C['col_sub'], fc="FFFFFF", ha="center", size=9)
+        ws.cell(R+1, 7).value = serial_fin
+        ws.cell(R+1, 7).number_format = "DD/MM/YYYY"
+        ws.cell(R+1, 7).font = fnt(color="FFFFFF", size=9)
+        ws.cell(R+1, 7).fill = fill(C['col_sub']); ws.cell(R+1, 7).border = thin()
+        for col in range(8, 13):
+            ws.cell(R+1, col).fill = fill(C['col_sub']); ws.cell(R+1, col).border = thin()
+
+        # ── Empleado / Cargo / Salario ──
+        ws.row_dimensions[R+2].height = 16
+        line(2, 1, "EMPLEADO:", bold=True, size=9)
+        ws.cell(R+2, 2).value = cedula
+        ws.cell(R+2, 2).font = fnt(size=9); ws.cell(R+2, 2).border = thin()
+        ws.merge_cells(start_row=R+2, start_column=3, end_row=R+2, end_column=8)
+        ws.cell(R+2, 3).value = nombre_completo.upper()
+        ws.cell(R+2, 3).font = fnt(bold=True, size=9); ws.cell(R+2, 3).border = thin()
+        ws.cell(R+2, 3).alignment = aln("center")
+        ws.cell(R+2, 9).value = "SALARIO MENSUAL:"
+        ws.cell(R+2, 9).font = fnt(bold=True, size=9); ws.cell(R+2, 9).border = thin()
+        ws.merge_cells(start_row=R+2, start_column=9, end_row=R+2, end_column=10)
+        ws.cell(R+2, 11).value = sal
+        ws.cell(R+2, 11).font = fnt(bold=True, size=9); ws.cell(R+2, 11).border = thin()
+        ws.cell(R+2, 11).number_format = "$#,##0"; ws.cell(R+2, 11).alignment = aln("right")
+        ws.cell(R+2, 12).border = thin()
+
+        ws.row_dimensions[R+3].height = 16
+        line(3, 1, "CARGO:", bold=True, size=9)
+        ws.merge_cells(start_row=R+3, start_column=2, end_row=R+3, end_column=6)
+        ws.cell(R+3, 2).value = cargo
+        ws.cell(R+3, 2).font = fnt(size=9); ws.cell(R+3, 2).border = thin()
+        for col in range(7, 13): ws.cell(R+3, col).border = thin()
+
+        # ── Separador ──
+        ws.row_dimensions[R+4].height = 6
+        ws.merge_cells(start_row=R+4, start_column=1, end_row=R+4, end_column=12)
+        ws.cell(R+4, 1).fill = fill(C['col_h']); ws.cell(R+4, 1).border = thin()
+
+        # ── Cabecera tabla ──
+        ws.row_dimensions[R+5].height = 18
+        for col, h in enumerate(["CODIGO","","","DESCRIPCION","","","DOC","CANT","DEVENGADO","DEDUCCION","","SALDO"], 1):
+            c = sc(ws, R+5, col, h, bold=True, bg=C['col_linea'], fc="FFFFFF", ha="center", size=9)
+        ws.merge_cells(start_row=R+5, start_column=1, end_row=R+5, end_column=3)
+        ws.merge_cells(start_row=R+5, start_column=4, end_row=R+5, end_column=6)
+        ws.merge_cells(start_row=R+5, start_column=10, end_row=R+5, end_column=11)
+
+        # ── Filas de conceptos ──
+        if tipo_col == "prestador":
+            conceptos = [
+                (1,  "HORAS TRABAJADAS",               round(t['tot_h'],10), t['val_total_prest'], None, C['col_dev']),
+                (2,  "AUXILIO DE TRANSPORTE",           0,              0,         None,    C['col_dev']),
+                (3,  "AUXILIO  ",                       0,              0,         None,    C['col_dev']),
+                (4,  "RECARGO NOCTURNO",                0,              0,         None,    C['col_dev']),
+                (121,"DEDUCCION DE PRESTAMOS",          None,           None,      0,       C['col_ded']),
+                (123,"DEDUCCION PENSION",               None,           None,      0,       C['col_ded']),
+                (127,"DEDUCCION SALUD",                 None,           None,      0,       C['col_ded']),
+            ]
+        else:
+            conceptos = [
+                (1,  "SALARIO BASICO",                 110,             sal_q,     None,    C['col_dev']),
+                (2,  "AUXILIO DE TRANSPORTE",           dias_trab,      aux_transp, None,   C['col_dev']),
+                (3,  "AUXILIO  ",                       round(t['en_h'],10), dev_ext, None, C['col_dev']),
+                (4,  "RECARGO NOCTURNO",               round(t['noct_h'],10), dev_noct, None, C['col_dev']),
+                (121,"DEDUCCION DE PRESTAMOS",          None,           None,      0,       C['col_ded']),
+                (123,f"DEDUCCION PENSION PROTECCIÓN 4%", None,          None,      pension, C['col_ded']),
+                (127,f"DEDUCCION SALUD 4% {eps.upper()}", None,         None,      salud,   C['col_ded']),
+            ]
+
+        for frow, (cod, desc, cant, dev, ded, bgc) in enumerate(conceptos):
+            r = R + 6 + frow
+            ws.row_dimensions[r].height = 15
+            ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=3)
+            ws.cell(r,1).value = cod; ws.cell(r,1).font = fnt(bold=True, size=9)
+            ws.cell(r,1).fill = fill(bgc); ws.cell(r,1).border = thin()
+            ws.cell(r,1).alignment = aln("center")
+            ws.merge_cells(start_row=r, start_column=4, end_row=r, end_column=6)
+            ws.cell(r,4).value = desc; ws.cell(r,4).font = fnt(size=9)
+            ws.cell(r,4).fill = fill(bgc); ws.cell(r,4).border = thin()
+            ws.cell(r,7).border = thin(); ws.cell(r,7).fill = fill(bgc)  # DOC
+            ws.cell(r,8).value = cant if cant else ""
+            ws.cell(r,8).font = fnt(size=9); ws.cell(r,8).fill = fill(bgc)
+            ws.cell(r,8).border = thin(); ws.cell(r,8).alignment = aln("right")
+            ws.cell(r,8).number_format = "0.##########"
+            ws.cell(r,9).value = dev if dev else ""
+            ws.cell(r,9).font = fnt(size=9); ws.cell(r,9).fill = fill(bgc)
+            ws.cell(r,9).border = thin(); ws.cell(r,9).alignment = aln("right")
+            ws.cell(r,9).number_format = "$#,##0.##"
+            ws.merge_cells(start_row=r, start_column=10, end_row=r, end_column=11)
+            ws.cell(r,10).value = ded if ded else ""
+            ws.cell(r,10).font = fnt(size=9); ws.cell(r,10).fill = fill(bgc)
+            ws.cell(r,10).border = thin(); ws.cell(r,10).alignment = aln("right")
+            ws.cell(r,10).number_format = "$#,##0.##"
+            ws.cell(r,12).border = thin(); ws.cell(r,12).fill = fill(bgc)
+
+        # ── Fila TOTALES ──
+        rt = R + 13; ws.row_dimensions[rt].height = 17
+        ws.merge_cells(start_row=rt, start_column=1, end_row=rt, end_column=6)
+        ws.cell(rt,1).value = "TOTALES"
+        ws.cell(rt,1).font = fnt(bold=True, size=9, color="FFFFFF")
+        ws.cell(rt,1).fill = fill(C['col_neto']); ws.cell(rt,1).border = thin()
+        ws.cell(rt,1).alignment = aln("right")
+        ws.cell(rt,7).border = thin(); ws.cell(rt,7).fill = fill(C['col_total'])
+        ws.cell(rt,8).border = thin(); ws.cell(rt,8).fill = fill(C['col_total'])
+        ws.cell(rt,9).value = total_dev
+        ws.cell(rt,9).font = fnt(bold=True, size=9); ws.cell(rt,9).fill = fill(C['col_total'])
+        ws.cell(rt,9).border = thin(); ws.cell(rt,9).alignment = aln("right")
+        ws.cell(rt,9).number_format = "$#,##0.##"
+        ws.merge_cells(start_row=rt, start_column=10, end_row=rt, end_column=11)
+        ws.cell(rt,10).value = total_ded
+        ws.cell(rt,10).font = fnt(bold=True, size=9); ws.cell(rt,10).fill = fill(C['col_total'])
+        ws.cell(rt,10).border = thin(); ws.cell(rt,10).alignment = aln("right")
+        ws.cell(rt,10).number_format = "$#,##0.##"
+        ws.cell(rt,12).border = thin(); ws.cell(rt,12).fill = fill(C['col_total'])
+
+        # ── NETO A PAGAR ──
+        rn = R + 14; ws.row_dimensions[rn].height = 20
+        ws.merge_cells(start_row=rn, start_column=1, end_row=rn, end_column=8)
+        ws.cell(rn,1).value = "NETO A PAGAR               "
+        ws.cell(rn,1).font = fnt(bold=True, size=10, color="FFFFFF")
+        ws.cell(rn,1).fill = fill(C['col_neto']); ws.cell(rn,1).border = thin()
+        ws.cell(rn,1).alignment = aln("right")
+        ws.merge_cells(start_row=rn, start_column=9, end_row=rn, end_column=12)
+        ws.cell(rn,9).value = neto
+        ws.cell(rn,9).font = fnt(bold=True, size=11, color="FFFFFF")
+        ws.cell(rn,9).fill = fill(C['col_neto']); ws.cell(rn,9).border = thin()
+        ws.cell(rn,9).alignment = aln("right")
+        ws.cell(rn,9).number_format = "$#,##0.##"
+
+        # ── Firma ──
+        rf = R + 15; ws.row_dimensions[rf].height = 15
+        ws.cell(rf,1).value = nombre_completo.upper()
+        ws.cell(rf,1).font = fnt(bold=True, size=9); ws.cell(rf,1).border = thin()
+        ws.merge_cells(start_row=rf, start_column=1, end_row=rf, end_column=6)
+
+        rc = R + 16; ws.row_dimensions[rc].height = 15
+        ws.cell(rc,1).value = f"C.C  "; ws.cell(rc,1).font = fnt(bold=True, size=9)
+        ws.cell(rc,1).border = thin()
+        ws.cell(rc,2).value = cedula; ws.cell(rc,2).font = fnt(size=9); ws.cell(rc,2).border = thin()
+
+        rb = R + 17; ws.row_dimensions[rb].height = 15
+        ws.cell(rb,1).value = "Cuenta:   "; ws.cell(rb,1).font = fnt(bold=True, size=9)
+        ws.cell(rb,1).border = thin()
+        ws.cell(rb,2).value = banco; ws.cell(rb,2).font = fnt(size=9); ws.cell(rb,2).border = thin()
+        ws.merge_cells(start_row=rb, start_column=2, end_row=rb, end_column=5)
+        ws.cell(rb,6).value = cuenta; ws.cell(rb,6).font = fnt(size=9); ws.cell(rb,6).border = thin()
+        ws.merge_cells(start_row=rb, start_column=6, end_row=rb, end_column=8)
+
+        # Fila espaciadora entre bloques
+        if bloque == 0:
+            ws.row_dimensions[R+18].height = 10
+            ws.row_dimensions[R+19].height = 4
+            for col in range(1, 13):
+                ws.cell(R+19, col).fill = fill(C['col_h']); ws.cell(R+19, col).border = thin()
+
+    # Anchos de columna
+    widths = [7, 9, 5, 12, 8, 8, 6, 12, 16, 14, 4, 10]
+    for i, w in enumerate(widths, 1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+
+    # Área de impresión
+    ws.print_area = f"A1:L{R+17}"
+    ws.page_setup.fitToPage = True
+    ws.page_setup.fitToWidth = 1
+    ws.page_setup.fitToHeight = 0
+
+
+def neto_empleado(t, datos):
+    """Calcula neto a pagar para un empleado (con deducciones)."""
+    sal_q    = t['salario'] / 2
+    dias     = t['dias_trab']
+    aux_t    = (AUXILIO_TRANSPORTE_ANUAL / 2) * dias / 15
+    ibc      = sal_q + t['val_en'] + t['val_noct']
+    ded      = ibc * (PENSION_PCT + SALUD_PCT)
+    total_dev = sal_q + aux_t + t['val_en'] + t['val_noct']
+    return total_dev - ded
+
+
+def crear_resumen_nomina(resultados_t, valentina_neto, p_ini, p_fin, nombre_out):
+    """
+    Genera RESUMEN_NOMINA con 4 secciones exactas del original:
+    1. Nómina para consignar (empleados con contrato)
+    2. Nómina en efectivo
+    3. Horas extras pagadas en efectivo
+    4. Prestadores de servicio
+    """
+    wb = openpyxl.Workbook(); wb.remove(wb.active)
+    ws = wb.create_sheet("Hoja1")
+    ws.sheet_view.showGridLines = False
+
+    # Columnas
+    ws.column_dimensions['A'].width = 3
+    ws.column_dimensions['B'].width = 14
+    ws.column_dimensions['C'].width = 34
+    ws.column_dimensions['D'].width = 22
+    ws.column_dimensions['E'].width = 18
+    ws.column_dimensions['F'].width = 16
+
+    mes_str = p_ini.strftime('%B').upper()
+    anio    = p_ini.year
+    q_str   = f"1 al 15" if p_ini.day == 1 else f"16 al {p_fin.day}"
+    periodo_label = f"TOTAL NOMINA {q_str} de {mes_str} de {anio}"
+
+    def seccion_header(row, titulo):
+        ws.merge_cells(f"B{row}:F{row}")
+        c = ws.cell(row, 2, value=titulo)
+        c.font = fnt(bold=True, color="FFFFFF", size=10)
+        c.fill = fill(C['col_neto']); c.alignment = aln("center"); c.border = thin()
+        ws.row_dimensions[row].height = 20
+
+    def col_header(row):
+        for col, h in enumerate(["CEDULA","NOMBRE","TIPO CUENTA","# CUENTA","VALOR A PAGAR"], 2):
+            sc(ws, row, col, h, bold=True, bg=C['col_linea'], fc="FFFFFF", ha="center", size=9)
+        ws.row_dimensions[row].height = 16
+
+    def data_row(row, cedula, nombre, tipo_cta, cuenta, valor, bg):
+        sc(ws, row, 2, cedula,   bg=bg, size=9)
+        sc(ws, row, 3, nombre,   bg=bg, size=9)
+        sc(ws, row, 4, tipo_cta, bg=bg, size=9)
+        sc(ws, row, 5, cuenta,   bg=bg, size=9)
+        sc(ws, row, 6, round(valor), bg=bg, ha="right", fmt="$#,##0", size=9)
+        ws.row_dimensions[row].height = 15
+
+    def total_row(row, valor):
+        ws.merge_cells(f"B{row}:E{row}")
+        ws.cell(row, 2).value = "TOTAL"
+        ws.cell(row, 2).font = fnt(bold=True, color="FFFFFF", size=9)
+        ws.cell(row, 2).fill = fill(C['h1']); ws.cell(row, 2).border = thin()
+        ws.cell(row, 2).alignment = aln("right")
+        sc(ws, row, 6, round(valor), bold=True, bg=C['h1'], fc="FFFFFF",
+           ha="right", fmt="$#,##0", size=9)
+        ws.row_dimensions[row].height = 16
+
+    def spacer(row):
+        ws.row_dimensions[row].height = 8
+
+    r = 1
+
+    # Título principal
+    ws.merge_cells(f"B{r}:F{r}")
+    c = ws.cell(r, 2, value="RESUMEN NOMINA PARA CONSIGNAR CON AUMENTOS")
+    c.font = fnt(bold=True, size=11); c.alignment = aln("center")
+    ws.row_dimensions[r].height = 22; r += 1
+
+    # ── SECCIÓN 1: Nómina para consignar ──────────────────────────────────────
+    col_header(r); r += 1
+
+    total_consignar = 0
+    empleados_consignar = []
+    for emp, t in resultados_t:
+        datos = COLABORADORES.get(emp['nombre'])
+        if not datos or datos[7] != "empleado": continue
+        cedula, nombre_c, cargo, banco, cuenta, eps, _, _ = datos
+        neto = neto_empleado(t, datos)
+        empleados_consignar.append((cedula, nombre_c, banco, cuenta, neto))
+        total_consignar += neto
+
+    # Agregar Valentina (empleada sin reloj)
+    vd = COLABORADORES.get("VALENTINA GRANDA")
+    if vd and valentina_neto > 0:
+        empleados_consignar.append((vd[0], vd[1], vd[3], vd[4], valentina_neto))
+        total_consignar += valentina_neto
+
+    for i, (ced, nom, banco, cta, neto) in enumerate(empleados_consignar):
+        bg = C['alt'] if i % 2 == 0 else C['blanco']
+        data_row(r, ced, nom, banco, cta, neto, bg); r += 1
+
+    total_row(r, total_consignar); r += 1; spacer(r); r += 1
+
+    # ── SECCIÓN 2: Nómina en efectivo ─────────────────────────────────────────
+    seccion_header(r, "RESUMEN NOMINA PARA PAGO EN EFECTIVO"); r += 1
+    col_header(r); r += 1
+    for _ in range(2):
+        for col in range(2, 7): sc(ws, r, col, "", bg=C['blanco'], size=9)
+        ws.row_dimensions[r].height = 15; r += 1
+    total_row(r, 0); r += 1; spacer(r); r += 1
+
+    # ── SECCIÓN 3: Horas extras en efectivo ───────────────────────────────────
+    seccion_header(r, "HORAS EXTRAS PAGAS EN EFECTIVO"); r += 1
+    for col, h in enumerate(["CEDULA","NOMBRE","","# CUENTA","VALOR A PAGAR"], 2):
+        sc(ws, r, col, h, bold=True, bg=C['col_linea'], fc="FFFFFF", ha="center", size=9)
+    ws.row_dimensions[r].height = 16; r += 1
+
+    total_ef = 0
+    filas_ef = []
+    for emp, t in resultados_t:
+        if t['val_ee'] > 0.5:
+            datos = COLABORADORES.get(emp['nombre'])
+            ced = datos[0] if datos else emp['id']
+            nom = datos[1] if datos else emp['nombre']
+            filas_ef.append((ced, nom, round(t['val_ee'])))
+            total_ef += t['val_ee']
+
+    if filas_ef:
+        for i, (ced, nom, val) in enumerate(filas_ef):
+            bg = C['amarillo'] if i % 2 == 0 else C['blanco']
+            sc(ws, r, 2, ced,  bg=bg, size=9)
+            sc(ws, r, 3, nom,  bg=bg, size=9)
+            sc(ws, r, 4, "",   bg=bg, size=9)
+            sc(ws, r, 5, "",   bg=bg, size=9)
+            sc(ws, r, 6, val,  bg=bg, ha="right", fmt="$#,##0", size=9)
+            ws.row_dimensions[r].height = 15; r += 1
+    else:
+        for col in range(2, 7): sc(ws, r, col, "", bg=C['blanco'], size=9)
+        ws.row_dimensions[r].height = 15; r += 1
+
+    total_row(r, total_ef); r += 1; spacer(r); r += 1
+
+    # ── SECCIÓN 4: Prestadores de servicio ────────────────────────────────────
+    seccion_header(r, "RESUMEN DE NOMINA PRESTADORES DE SERVICIO"); r += 1
+    for col, h in enumerate(["CEDULA","NOMBRE","","# CUENTA","VALOR A PAGAR"], 2):
+        sc(ws, r, col, h, bold=True, bg=C['col_linea'], fc="FFFFFF", ha="center", size=9)
+    ws.row_dimensions[r].height = 16; r += 1
+
+    total_prest = 0
+    for emp, t in resultados_t:
+        datos = COLABORADORES.get(emp['nombre'])
+        if not datos or datos[7] != "prestador": continue
+        ced = datos[0]; nom = datos[1]
+        val = t['val_total_prest']
+        total_prest += val
+        sc(ws, r, 2, ced, bg=C['alt'],    size=9)
+        sc(ws, r, 3, nom, bg=C['alt'],    size=9)
+        sc(ws, r, 4, "",  bg=C['alt'],    size=9)
+        sc(ws, r, 5, "",  bg=C['alt'],    size=9)
+        sc(ws, r, 6, round(val), bg=C['alt'], ha="right", fmt="$#,##0", size=9)
+        ws.row_dimensions[r].height = 15; r += 1
+
+    # Fila vacía extra
+    for col in range(2, 7): sc(ws, r, col, "", bg=C['blanco'], size=9)
+    ws.row_dimensions[r].height = 15; r += 1
+    total_row(r, total_prest); r += 1; spacer(r); r += 1
+
+    # ── GRAN TOTAL ────────────────────────────────────────────────────────────
+    gran_total = total_consignar + total_ef + total_prest
+    ws.merge_cells(f"B{r}:E{r}")
+    ws.cell(r, 2).value = periodo_label
+    ws.cell(r, 2).font = fnt(bold=True, color="FFFFFF", size=10)
+    ws.cell(r, 2).fill = fill(C['col_h']); ws.cell(r, 2).border = thin()
+    ws.cell(r, 2).alignment = aln("right")
+    sc(ws, r, 6, round(gran_total), bold=True, bg=C['col_h'], fc="FFFFFF",
+       ha="right", fmt="$#,##0", size=10)
+    ws.row_dimensions[r].height = 22
+
+    ws.freeze_panes = "B2"
+    wb.save(nombre_out)
+    print(f"✅ {nombre_out}")
+    return gran_total
+
+
+def crear_colilla_pago(resultados_t, p_ini, p_fin, nombre_out):
+    wb = openpyxl.Workbook(); wb.remove(wb.active)
+
+    # Hoja resumen de pagos (para transferencias)
+    ws = wb.create_sheet("RESUMEN PAGO", 0)
+    ws.sheet_view.showGridLines = False
+    ws.merge_cells("A1:G1")
+    c = ws["A1"]; c.value = f"RESUMEN DE NÓMINA PARA PAGO — {p_ini.strftime('%d/%m/%Y')} AL {p_fin.strftime('%d/%m/%Y')}"
+    c.font = fnt(bold=True, color="FFFFFF", size=12); c.fill = fill(C['col_neto']); c.alignment = aln("center")
+    ws.row_dimensions[1].height = 26
+
+    hdrs = ["Nombre Completo","Cédula","Banco","N° Cuenta","Total Devengado","Deducciones","NETO A PAGAR"]
+    for col, h in enumerate(hdrs, 1):
+        c = sc(ws, 2, col, h, bold=True, bg=C['col_linea'], fc="FFFFFF", ha="center")
+        c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    ws.row_dimensions[2].height = 22
+
+    gran_neto = 0
+    for i, (emp, t) in enumerate(resultados_t):
+        r = i + 3; bg = C['alt'] if i % 2 == 0 else C['blanco']
+        datos = COLABORADORES.get(emp['nombre'], (emp['id'], emp['nombre'], "", "", "", "SAVIA SALUD", t['salario'], "empleado"))
+        cedula, nombre_c, cargo, banco, cuenta, eps, _, tipo_col = datos
+        if tipo_col == "prestador":
+            neto = t['val_total_prest']; ded = 0; total_dev = neto
+        else:
+            sal_q = t['salario'] / 2; dias_trab = t['dias_trab']
+            aux_t = (AUXILIO_TRANSPORTE_ANUAL / 2) * dias_trab / 15
+            ibc = sal_q + t['val_en'] + t['val_noct']
+            ded = ibc * (PENSION_PCT + SALUD_PCT)
+            total_dev = sal_q + aux_t + t['val_en'] + t['val_noct']
+            neto = total_dev - ded
+        gran_neto += neto
+
+        vals = [nombre_c, cedula, banco, cuenta,
+                round(total_dev), round(ded), round(neto)]
+        fmts = [None, None, None, None, '$#,##0', '$#,##0', '$#,##0']
+        for col, (v, fm) in enumerate(zip(vals, fmts), 1):
+            sc(ws, r, col, v, bg=bg, ha="right" if col > 4 else "left", fmt=fm)
+        ws.row_dimensions[r].height = 15
+
+    # Totales
+    n = len(resultados_t); tr = n + 3
+    sc(ws, tr, 1, "TOTAL A TRANSFERIR", bold=True, bg=C['col_neto'], fc="FFFFFF")
+    ws.merge_cells(start_row=tr, start_column=1, end_row=tr, end_column=6)
+    sc(ws, tr, 7, round(gran_neto), bold=True, bg=C['col_neto'], fc="FFFFFF",
+       ha="right", fmt='$#,##0')
+    ws.row_dimensions[tr].height = 20
+
+    for i, w in enumerate([30, 14, 20, 18, 15, 15, 15], 1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+    ws.freeze_panes = "A3"
+
+    # Colillas individuales
+    for emp, t in resultados_t:
+        datos = COLABORADORES.get(emp['nombre'],
+                   (emp['id'], emp['nombre'], "CARGO", "DAVIVIENDA", "", "SAVIA SALUD", t['salario'], "empleado"))
+        colilla_empleado(wb, emp, t, p_ini, p_fin, datos)
+
+    wb.save(nombre_out)
+    print(f"✅ {nombre_out}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  MAIN
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def main():
+    parser = argparse.ArgumentParser(description="Nómina Soccer 7 — GRANDA VARGAS SAS")
+    parser.add_argument("archivo", help="CSV del reloj biométrico Zkteco K50")
+    parser.add_argument("--inicio", help="YYYY-MM-DD inicio período")
+    parser.add_argument("--fin",    help="YYYY-MM-DD fin período")
+    args = parser.parse_args()
+
+    print(f"📂 Leyendo {args.archivo}...")
+    df = None
+    for sep in [',', ';', '\t']:
+        try:
+            tmp = pd.read_csv(args.archivo, sep=sep, encoding='utf-8-sig')
+            if len(tmp.columns) >= 4: df = tmp; break
+        except: pass
+    if df is None: print("ERROR: No se pudo leer el CSV."); return
+
+    fechas = sorted([parse_date(str(r)) for r in df['Tiempo']])
+    if args.inicio:
+        p_ini = datetime.strptime(args.inicio, "%Y-%m-%d")
+    else:
+        mf = fechas[0]
+        p_ini = mf.replace(day=1 if mf.day <= 15 else 16, hour=0, minute=0, second=0)
+    if args.fin:
+        p_fin = datetime.strptime(args.fin, "%Y-%m-%d").replace(hour=23, minute=59, second=59)
+    else:
+        ult = calendar.monthrange(p_ini.year, p_ini.month)[1]
+        p_fin = p_ini.replace(day=15 if p_ini.day == 1 else ult, hour=23, minute=59, second=59)
+
+    print(f"   Período: {p_ini.strftime('%d/%m/%Y')} → {p_fin.strftime('%d/%m/%Y')}")
+    print(f"   {df['Nombre'].nunique()} colaboradoras | {len(df)} marcaciones")
+
+    resultados = procesar(df, p_ini, p_fin)
+    resultados_t = []
+    for emp in resultados:
+        datos = COLABORADORES.get(emp['nombre'], (emp['id'], emp['nombre'], "", "", "", "SAVIA SALUD", SALARIO_MINIMO, "empleado"))
+        sal  = datos[6]
+        tipo = datos[7]
+        t = calcular(emp, sal, tipo)
+        resultados_t.append((emp, t))
+
+    # Valentina: empleada sin reloj biométrico — calcular su neto fijo
+    vd = COLABORADORES.get("VALENTINA GRANDA")
+    valentina_neto = 0
+    if vd:
+        sal_v = vd[6]; sal_v_q = sal_v / 2
+        aux_v = AUXILIO_TRANSPORTE_ANUAL / 2
+        ibc_v = sal_v_q  # sin extras ni recargo para admin
+        ded_v = ibc_v * (PENSION_PCT + SALUD_PCT)
+        valentina_neto = sal_v_q + aux_v - ded_v
+
+    tag = f"{p_ini.strftime('%Y%m%d')}_{p_fin.strftime('%Y%m%d')}"
+    crear_reporte_horarios(resultados_t, p_ini, p_fin, f"REPORTE_HORARIOS_{tag}.xlsx")
+    crear_colilla_pago(resultados_t, p_ini, p_fin, f"COLILLA_DE_PAGO_SOCCER7_{tag}.xlsx")
+    gran_total = crear_resumen_nomina(resultados_t, valentina_neto, p_ini, p_fin, f"RESUMEN_NOMINA_{tag}.xlsx")
+
+    print(f"\n{'Nombre':<30} {'H. Trab':>8} {'Tipo':>10} {'Noct $':>11} {'Neto a Pagar':>14}")
+    print("─" * 80)
+    for emp, t in resultados_t:
+        datos = COLABORADORES.get(emp['nombre'], (emp['id'], emp['nombre'], "", "", "", "", SALARIO_MINIMO, "empleado"))
+        tipo = datos[7]
+        if tipo == "prestador":
+            neto = t['val_total_prest']; tipo_label = "PRESTADOR"
+        else:
+            sal_q = t['salario'] / 2; days = t['dias_trab']
+            aux = (AUXILIO_TRANSPORTE_ANUAL/2) * days / 15
+            ibc = sal_q + t['val_en'] + t['val_noct']
+            ded = ibc * (PENSION_PCT + SALUD_PCT)
+            neto = sal_q + aux + t['val_en'] + t['val_noct'] - ded
+            tipo_label = f"+{t['en_h']:.1f}h" if t['en_h'] > 0 else (f"DEBE {t['deu_h']:.0f}h" if t['deu_h'] > 0.1 else "✓")
+        print(f"  {emp['nombre']:<28} {t['tot_h']:>7.1f}h {tipo_label:>10}  ${t['val_noct']:>9,.0f}  ${neto:>12,.0f}")
+    if valentina_neto > 0:
+        print(f"  {'VALENTINA GRANDA AGUDELO':<28} {'(admin)':>7}  {'sin reloj':>10}  ${'0':>9}  ${valentina_neto:>12,.0f}")
+    print("─" * 80)
+    print(f"  {'GRAN TOTAL NÓMINA':>52}             ${gran_total:>12,.0f}\n")
+
+
+if __name__ == "__main__":
+    main()
