@@ -46,7 +46,7 @@ FACTOR_EXTRA    = 1.25
 FACTOR_NOCT     = 0.35
 PENSION_PCT     = 0.04
 SALUD_PCT       = 0.04
-SALARIO_MINIMO  = 1423500           # 2026
+SALARIO_MINIMO  = 1750905           # 2026
 
 # Datos de cada colaborador: (cedula, nombre_completo, cargo, banco, cuenta, eps, salario)
 COLABORADORES = {
@@ -61,7 +61,7 @@ COLABORADORES = {
     "KAROL QUINTERO":       ("1045018453", "KAROL DAYANA QUINTERO AGUDELO",      "MESERA",                   "AHORROS DAVIVIENDA", "3974-0008-5007", "SAVIA SALUD", 1750905, "empleado"),
     "KATERINE SEPULVEDA":   ("1000211127", "KATERIN MARYORY SEPULVEDA CRUZ",     "MESERA",                   "AHORROS DAVIVIENDA", "4884-4926-8785", "SAVIA SALUD", 1750905, "empleado"),
     "MARIA LIGELLA LOTERO": ("43844703",   "MARIA LIGELLA LOTERO",               "AUXILIAR ADMINISTRATIVA",  "AHORROS DAVIVIENDA", "4884-5662-0761", "SAVIA SALUD", 1750905, "empleado"),
-    "JULIANA GOMEZ":        ("",           "JULIANA GOMEZ",                      "MESERA",                   "AHORROS DAVIVIENDA", "",               "",            10000,    "prestador"),
+    "JULIANA GOMEZ":        ("",           "JULIANA GOMEZ",                      "AUXILIAR DE COCINA",       "AHORROS DAVIVIENDA", "",               "",            10000,    "prestador"),
     # Valentina: empleada que no registra en el reloj (administrativa)
     # Su pago se calcula manualmente y se agrega al resumen
     "VALENTINA GRANDA":     ("1000397698", "VALENTINA GRANDA AGUDELO",           "AUXILIAR ADMINISTRATIVA",  "AHORROS DAVIVIENDA", "4884-5408-1842", "SAVIA SALUD", 1750905, "empleado"),
