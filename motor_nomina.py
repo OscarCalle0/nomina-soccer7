@@ -23,7 +23,7 @@ import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 from datetime import datetime, timedelta
-import argparse, calendar
+import calendar
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  CONFIGURACIÓN — EDITAR AQUÍ
@@ -1157,6 +1157,7 @@ def crear_colilla_pago(resultados_t, p_ini, p_fin, nombre_out):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def main():
+    import argparse
     parser = argparse.ArgumentParser(description="Nómina Soccer 7 — GRANDA VARGAS SAS")
     parser.add_argument("archivo", help="CSV del reloj biométrico Zkteco K50")
     parser.add_argument("--inicio", help="YYYY-MM-DD inicio período")
