@@ -126,38 +126,194 @@ if "⚙️" in modulo:
                     if "Numero" in df_reloj.columns and "Número" not in df_reloj.columns:
                         df_reloj.rename(columns={"Numero": "Número"}, inplace=True)
 
-                    # Detectar colaboradoras
                     p_ini_dt = datetime.combine(fecha_ini, datetime.min.time())
                     p_fin_dt = datetime.combine(fecha_fin, datetime.max.time())
                     resultados_raw = procesar(df_reloj, p_ini_dt, p_fin_dt)
 
-                    st.success(f"✅ **{archivo.name}** cargado · {len(df_reloj)} marcaciones · {len(resultados_raw)} colaboradoras detectadas")
-
-                    # Verificar quién está en la BD
-                    cols_check = []
-                    for emp in resultados_raw:
-                        col_db = get_colaborador_por_reloj(emp["nombre"], colaboradores_db)
-                        cols_check.append({
-                            "Nombre en reloj": emp["nombre"],
-                            "Estado": "✅ En base de datos" if col_db else "⚠️ No encontrada",
-                            "Días sin registro": len([d for d in emp["dias"] if not d["tiene"]]),
-                        })
-                    st.dataframe(pd.DataFrame(cols_check), hide_index=True, use_container_width=True)
-
-                    # Guardar en session_state
-                    st.session_state["df_reloj"]      = df_reloj
-                    st.session_state["resultados_raw"] = resultados_raw
-                    st.session_state["p_ini_dt"]       = p_ini_dt
-                    st.session_state["p_fin_dt"]       = p_fin_dt
-                    st.session_state["novedades"]      = {e["nombre"]: [] for e in resultados_raw}
+                    st.session_state["df_reloj"]       = df_reloj
+                    st.session_state["resultados_raw"]  = resultados_raw
+                    st.session_state["p_ini_dt"]        = p_ini_dt
+                    st.session_state["p_fin_dt"]        = p_fin_dt
+                    st.session_state["novedades"]       = {e["nombre"]: [] for e in resultados_raw}
                     st.session_state["marcaciones_manuales"] = []
+
+                    st.success(f"✅ **{archivo.name}** · {len(df_reloj)} marcaciones · {len(resultados_raw)} colaboradoras")
 
                 else:
                     st.error("No se pudo leer el archivo. Verifica el formato.")
             except Exception as e:
                 st.error(f"Error leyendo el archivo: {e}")
 
-    # ── PASO 3: Marcaciones manuales ──────────────────────────────────────
+    # ── PRE-INFORME con edición directa ───────────────────────────────────
+    resultados_raw = st.session_state.get("resultados_raw", [])
+    if resultados_raw:
+        st.divider()
+        st.markdown("### 📋 Pre-informe — Revisión y corrección")
+        st.caption("Revisa cada colaboradora. Edita directamente las marcaciones incorrectas y aplica los cambios antes de calcular.")
+
+        p_ini_dt = st.session_state["p_ini_dt"]
+        p_fin_dt = st.session_state["p_fin_dt"]
+        DIAS_SEM  = ["Lun","Mar","Mié","Jue","Vie","Sáb","Dom"]
+
+        # ── Métricas globales ──────────────────────────────────────────────
+        total_alertas = sum(
+            len([d for d in e["dias"] if d["tiene"] and (d["ef"]=="missing" or d["sf"]=="missing")])
+            for e in resultados_raw)
+        total_sin = sum(len([d for d in e["dias"] if not d["tiene"]]) for e in resultados_raw)
+        total_ok  = sum(len([d for d in e["dias"] if d["tiene"] and d["ef"]=="ok" and d["sf"]=="ok"]) for e in resultados_raw)
+
+        m1,m2,m3,m4 = st.columns(4)
+        m1.metric("Colaboradoras", len(resultados_raw))
+        m2.metric("Días completos ✅", total_ok)
+        m3.metric("Alertas ⚠️", total_alertas, delta="requieren revisión" if total_alertas else None, delta_color="inverse")
+        m4.metric("Sin registro ⚪", total_sin, delta="descanso o novedad" if total_sin else None, delta_color="off")
+
+        st.divider()
+
+        # ── Preinforme por colaboradora ────────────────────────────────────
+        for emp_idx, emp in enumerate(resultados_raw):
+            col_db     = get_colaborador_por_reloj(emp["nombre"], colaboradores_db)
+            dias_ok    = [d for d in emp["dias"] if d["tiene"] and d["ef"]=="ok" and d["sf"]=="ok"]
+            dias_alert = [d for d in emp["dias"] if d["tiene"] and (d["ef"]=="missing" or d["sf"]=="missing")]
+            dias_sin   = [d for d in emp["dias"] if not d["tiene"]]
+            horas_tot  = sum(d["trab"]*24 for d in emp["dias"] if d["trab"])
+
+            icono  = "⚠️" if dias_alert else "✅"
+            bd_txt = "✅ En BD" if col_db else "❌ No registrada en el sistema"
+            titulo = (f"{icono} **{emp['nombre']}** — "
+                      f"{horas_tot:.1f}h · {len(dias_ok)} OK · "
+                      f"{len(dias_alert)} alertas · {len(dias_sin)} sin registro · {bd_txt}")
+
+            with st.expander(titulo, expanded=bool(dias_alert)):
+                if not col_db:
+                    st.warning(f"⚠️ {emp['nombre']} no está en la base de datos. Agrégala en el módulo **Colaboradores** antes de continuar.")
+
+                # Tabla de días con semáforo
+                st.markdown("**Días del período:**")
+
+                # Cabecera
+                hc1,hc2,hc3,hc4,hc5,hc6,hc7 = st.columns([1.2,1.2,1.2,1.5,1.5,2,0.8])
+                hc1.caption("Fecha"); hc2.caption("Entrada reloj"); hc3.caption("Salida reloj")
+                hc4.caption("Nueva entrada"); hc5.caption("Nueva salida")
+                hc6.caption("Estado"); hc7.caption("Horas")
+
+                correcciones_emp = {}
+
+                for d in emp["dias"]:
+                    dia_nom   = DIAS_SEM[d["fecha"].weekday()]
+                    fecha_str = f"{dia_nom} {d['fecha'].day:02d}/{d['fecha'].month:02d}"
+
+                    entrada_reloj = d["entrada"].strftime("%H:%M") if d["entrada"] else "—"
+                    salida_reloj  = d["salida"].strftime("%H:%M")  if d["salida"]  else "—"
+
+                    if not d["tiene"]:
+                        estado_txt = "⚪ Sin registro"
+                        estado_color = "color:#888"
+                    elif d["ef"] == "missing":
+                        estado_txt = "🟠 Sin ENTRADA"
+                        estado_color = "color:#E59866"
+                    elif d["sf"] == "missing":
+                        estado_txt = "🟠 Sin SALIDA"
+                        estado_color = "color:#E59866"
+                    else:
+                        estado_txt = "🟢 Completo"
+                        estado_color = "color:#1E8449"
+
+                    horas_str = f"{d['trab']*24:.1f}h" if d["trab"] else "—"
+
+                    row_key = f"pre_{emp_idx}_{d['dk']}"
+                    c1,c2,c3,c4,c5,c6,c7 = st.columns([1.2,1.2,1.2,1.5,1.5,2,0.8])
+
+                    with c1: st.markdown(f"<span style='font-size:13px'>{fecha_str}</span>", unsafe_allow_html=True)
+                    with c2: st.markdown(f"<span style='font-family:monospace;font-size:13px'>{entrada_reloj}</span>", unsafe_allow_html=True)
+                    with c3: st.markdown(f"<span style='font-family:monospace;font-size:13px'>{salida_reloj}</span>", unsafe_allow_html=True)
+                    with c4:
+                        nueva_entrada = st.text_input(
+                            "NE", value="", placeholder="HH:MM",
+                            key=f"ne_{emp_idx}_{d['dk']}",
+                            label_visibility="collapsed"
+                        )
+                    with c5:
+                        nueva_salida = st.text_input(
+                            "NS", value="", placeholder="HH:MM",
+                            key=f"ns_{emp_idx}_{d['dk']}",
+                            label_visibility="collapsed"
+                        )
+                    with c6:
+                        st.markdown(f"<span style='{estado_color};font-size:12px'>{estado_txt}</span>", unsafe_allow_html=True)
+                    with c7:
+                        st.markdown(f"<span style='font-size:12px;font-family:monospace'>{horas_str}</span>", unsafe_allow_html=True)
+
+                    if nueva_entrada.strip() or nueva_salida.strip():
+                        correcciones_emp[d["dk"]] = {
+                            "nombre": emp["nombre"],
+                            "fecha": d["fecha"].strftime("%d/%m/%Y"),
+                            "entrada": nueva_entrada.strip() or None,
+                            "salida":  nueva_salida.strip()  or None,
+                        }
+
+                # Botón aplicar correcciones de este empleado
+                if correcciones_emp:
+                    st.markdown("")
+                    if st.button(f"✅ Aplicar correcciones de {emp['nombre'].split()[0]}",
+                                 key=f"apply_{emp_idx}", type="primary"):
+                        df_actual = st.session_state["df_reloj"]
+                        filas_nuevas = []
+                        errores_c = []
+
+                        for dk, corr in correcciones_emp.items():
+                            emp_data = next((e for e in resultados_raw if e["nombre"] == corr["nombre"]), None)
+                            emp_id   = emp_data["id"] if emp_data else "0"
+                            try:
+                                fecha_dt = datetime.strptime(corr["fecha"], "%d/%m/%Y")
+                            except:
+                                errores_c.append(f"Fecha inválida: {corr['fecha']}"); continue
+
+                            if corr["entrada"]:
+                                try:
+                                    hh,mm = map(int, corr["entrada"].split(":"))
+                                    ts = fecha_dt.replace(hour=hh, minute=mm, second=0)
+                                    filas_nuevas.append({
+                                        "Número": emp_id, "Nombre": corr["nombre"],
+                                        "Tiempo": ts.strftime("%d/%m/%Y %H:%M:%S"),
+                                        "Estado": "Entrada", "Dispositivos": "MANUAL", "Tipo de Registro": 0
+                                    })
+                                except: errores_c.append(f"Hora entrada inválida: {corr['entrada']}")
+
+                            if corr["salida"]:
+                                try:
+                                    hh,mm = map(int, corr["salida"].split(":"))
+                                    if hh < 6 and corr["entrada"] and int(corr["entrada"].split(":")[0]) >= 12:
+                                        ts_s = (fecha_dt + timedelta(days=1)).replace(hour=hh, minute=mm, second=0)
+                                    else:
+                                        ts_s = fecha_dt.replace(hour=hh, minute=mm, second=0)
+                                    filas_nuevas.append({
+                                        "Número": emp_id, "Nombre": corr["nombre"],
+                                        "Tiempo": ts_s.strftime("%d/%m/%Y %H:%M:%S"),
+                                        "Estado": "Salida", "Dispositivos": "MANUAL", "Tipo de Registro": 0
+                                    })
+                                except: errores_c.append(f"Hora salida inválida: {corr['salida']}")
+
+                        if errores_c:
+                            for e in errores_c: st.error(e)
+                        elif filas_nuevas:
+                            df_nuevo = pd.concat([df_actual, pd.DataFrame(filas_nuevas)], ignore_index=True)
+                            nuevos_res = procesar(df_nuevo, p_ini_dt, p_fin_dt)
+                            st.session_state["df_reloj"]      = df_nuevo
+                            st.session_state["resultados_raw"] = nuevos_res
+                            st.success(f"✅ {len(filas_nuevas)} marcación(es) aplicada(s) para {emp['nombre'].split()[0]}")
+                            st.rerun()
+
+                # Resumen rápido al final del expander
+                st.divider()
+                rc1, rc2, rc3 = st.columns(3)
+                rc1.metric("Total horas", f"{horas_tot:.1f}h",
+                           delta=f"{horas_tot-88:.1f}h vs meta" if horas_tot else None,
+                           delta_color="normal")
+                rc2.metric("Días trabajados", len(dias_ok) + len(dias_alert))
+                rc3.metric("Días sin registro", len(dias_sin))
+
+
     with st.expander("✏️ Paso 3 — Marcaciones manuales (opcional)"):
         st.caption("Agrega días que el reloj no registró. Deja vacío si no aplica.")
 
